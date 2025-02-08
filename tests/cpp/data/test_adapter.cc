@@ -36,7 +36,7 @@ TEST(Adapter, CSRAdapter) {
 }
 
 TEST(Adapter, CSRArrayAdapter) {
-  HostDeviceVector<bst_row_t> indptr;
+  HostDeviceVector<std::size_t> indptr;
   HostDeviceVector<float> values;
   HostDeviceVector<bst_feature_t> indices;
   size_t n_features = 100, n_samples = 10;
@@ -93,11 +93,11 @@ TEST(Adapter, CSCAdapterColsMoreThanRows) {
 
 // A mock for JVM data iterator.
 class CSRIterForTest {
-  std::vector<float> data_ {1, 2, 3, 4, 5};
-  std::vector<std::remove_pointer<decltype(std::declval<XGBoostBatchCSR>().index)>::type>
-      feature_idx_ {0, 1, 0, 1, 1};
-  std::vector<std::remove_pointer<decltype(std::declval<XGBoostBatchCSR>().offset)>::type>
-      row_ptr_ {0, 2, 4, 5, 5};
+  std::vector<float> data_{1, 2, 3, 4, 5};
+  std::vector<std::remove_pointer_t<decltype(std::declval<XGBoostBatchCSR>().index)>> feature_idx_{
+      0, 1, 0, 1, 1};
+  std::vector<std::remove_pointer_t<decltype(std::declval<XGBoostBatchCSR>().offset)>> row_ptr_{
+      0, 2, 4, 5, 5};
   size_t iter_ {0};
 
  public:
@@ -155,7 +155,7 @@ TEST(Adapter, IteratorAdapter) {
   ASSERT_EQ(data->Info().num_row_, kRows);
   int num_batch = 0;
   for (auto const& batch : data->GetBatches<SparsePage>()) {
-    ASSERT_EQ(batch.offset.HostVector(), std::vector<bst_row_t>({0, 2, 4, 5, 5, 7, 9, 10, 10}));
+    ASSERT_EQ(batch.offset.HostVector(), std::vector<bst_idx_t>({0, 2, 4, 5, 5, 7, 9, 10, 10}));
     ++num_batch;
   }
   ASSERT_EQ(num_batch, 1);

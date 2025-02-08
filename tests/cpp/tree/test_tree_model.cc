@@ -1,11 +1,12 @@
-// Copyright by Contributors
+/**
+ * Copyright 2018-2024, XGBoost Contributors
+ */
 #include <gtest/gtest.h>
 
 #include "../../../src/common/bitfield.h"
 #include "../../../src/common/categorical.h"
 #include "../filesystem.h"
 #include "../helpers.h"
-#include "xgboost/json_io.h"
 #include "xgboost/tree_model.h"
 
 namespace xgboost {
@@ -339,6 +340,7 @@ void TestCategoricalTreeDump(std::string format, std::string sep) {
   ASSERT_NE(pos, std::string::npos);
   pos = str.find(cond_str, pos + 1);
   ASSERT_NE(pos, std::string::npos);
+  ASSERT_NE(str.find("gain"), std::string::npos);
 
   if (format == "json") {
     // Make sure it's valid JSON
@@ -404,7 +406,7 @@ TEST(Tree, DumpText) {
   }
   ASSERT_EQ(n_conditions, 3ul);
 
-  ASSERT_NE(str.find("[f0<0]"), std::string::npos);
+  ASSERT_NE(str.find("[f0<0]"), std::string::npos) << str;
   ASSERT_NE(str.find("[f1<1]"), std::string::npos);
   ASSERT_NE(str.find("[f2<2]"), std::string::npos);
 
@@ -449,7 +451,8 @@ TEST(Tree, DumpDot) {
   fmap.PushBack(2, "feat_2", "int");
 
   str = tree.DumpModel(fmap, true, "dot");
-  ASSERT_NE(str.find(R"("feat_0")"), std::string::npos);
+  ASSERT_NE(str.find(R"("feat_0)"), std::string::npos);
+  ASSERT_EQ(str.find(R"("feat_0")"), std::string::npos);  // newline
   ASSERT_NE(str.find(R"(feat_1<1)"), std::string::npos);
   ASSERT_NE(str.find(R"(feat_2<2)"), std::string::npos);
 

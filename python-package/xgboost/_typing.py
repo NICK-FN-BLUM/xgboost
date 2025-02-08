@@ -5,10 +5,13 @@ import os
 from typing import (
     TYPE_CHECKING,
     Any,
+    AnyStr,
     Callable,
     Dict,
     List,
+    Optional,
     Sequence,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -20,21 +23,27 @@ import numpy as np
 
 DataType = Any
 
-# xgboost accepts some other possible types in practice due to historical reason, which is
-# lesser tested.  For now we encourage users to pass a simple list of string.
 FeatureInfo = Sequence[str]
 FeatureNames = FeatureInfo
 FeatureTypes = FeatureInfo
 BoosterParam = Union[List, Dict[str, Any]]  # better be sequence
 
 ArrayLike = Any
-PathLike = Union[str, os.PathLike]
+if TYPE_CHECKING:
+    PathLike = Union[str, os.PathLike[str]]
+else:
+    PathLike = Union[str, os.PathLike]
 CupyT = ArrayLike  # maybe need a stub for cupy arrays
 NumpyOrCupy = Any
-NumpyDType = Union[str, Type[np.number]]
+NumpyDType = Union[str, Type[np.number]]  # pylint: disable=invalid-name
 PandasDType = Any  # real type is pandas.core.dtypes.base.ExtensionDtype
 
 FloatCompatible = Union[float, np.float32, np.float64]
+
+# typing.SupportsInt is not suitable here since floating point values are convertible to
+# integers as well.
+Integer = Union[int, np.integer]
+IterationRange = Tuple[Integer, Integer]
 
 # callables
 FPreProcCallable = Callable
@@ -43,7 +52,7 @@ FPreProcCallable = Callable
 # c_bst_ulong corresponds to bst_ulong defined in xgboost/c_api.h
 c_bst_ulong = ctypes.c_uint64  # pylint: disable=C0103
 
-ModelIn = Union[str, bytearray, os.PathLike]
+ModelIn = Union[os.PathLike[AnyStr], bytearray, str]
 
 CTypeT = TypeVar(
     "CTypeT",
@@ -96,6 +105,13 @@ else:
         ctypes._Pointer,
         ctypes._Pointer,
     ]
+
+# The second arg is actually Optional[List[cudf.Series]], skipped for easier type check.
+# The cudf Series is the obtained cat codes, preserved in the `DataIter` to prevent it
+# being freed.
+TransformedData = Tuple[
+    Any, Optional[List], Optional[FeatureNames], Optional[FeatureTypes]
+]
 
 # template parameter
 _T = TypeVar("_T")

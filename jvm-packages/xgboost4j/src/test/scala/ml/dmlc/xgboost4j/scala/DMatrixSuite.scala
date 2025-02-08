@@ -20,12 +20,13 @@ import java.util.Arrays
 
 import scala.util.Random
 
-import org.scalatest.FunSuite
+import org.scalatest.funsuite.AnyFunSuite
+
 import ml.dmlc.xgboost4j.java.{DMatrix => JDMatrix}
 
-class DMatrixSuite extends FunSuite {
+class DMatrixSuite extends AnyFunSuite {
   test("create DMatrix from File") {
-    val dmat = new DMatrix("../../demo/data/agaricus.txt.test")
+    val dmat = new DMatrix("../../demo/data/agaricus.txt.test?format=libsvm")
     // get label
     val labels: Array[Float] = dmat.getLabel
     // check length

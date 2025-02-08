@@ -1,5 +1,5 @@
 /**
- * Copyright 2014-2023 by XGBoost Contributors
+ * Copyright 2014-2024, XGBoost Contributors
  * \file updater_refresh.cc
  * \brief refresh the statistics and leaf value on the tree on the dataset
  * \author Tianqi Chen
@@ -9,8 +9,7 @@
 #include <limits>
 #include <vector>
 
-#include "../collective/communicator-inl.h"
-#include "../common/io.h"
+#include "../collective/allreduce.h"
 #include "../common/threading_utils.h"
 #include "../predictor/predict_fn.h"
 #include "./param.h"
@@ -20,7 +19,7 @@ namespace xgboost::tree {
 
 DMLC_REGISTRY_FILE_TAG(updater_refresh);
 
-/*! \brief pruner that prunes a tree after growing finishs */
+/*! \brief pruner that prunes a tree after growing finishes */
 class TreeRefresher : public TreeUpdater {
  public:
   explicit TreeRefresher(Context const *ctx) : TreeUpdater(ctx) {}
@@ -31,12 +30,15 @@ class TreeRefresher : public TreeUpdater {
   [[nodiscard]] char const *Name() const override { return "refresh"; }
   [[nodiscard]] bool CanModifyTree() const override { return true; }
   // update the tree, do pruning
-  void Update(TrainParam const *param, HostDeviceVector<GradientPair> *gpair, DMatrix *p_fmat,
+  void Update(TrainParam const *param, linalg::Matrix<GradientPair> *gpair, DMatrix *p_fmat,
               common::Span<HostDeviceVector<bst_node_t>> /*out_position*/,
               const std::vector<RegTree *> &trees) override {
-    if (trees.size() == 0) return;
-    const std::vector<GradientPair> &gpair_h = gpair->ConstHostVector();
-    // thread temporal space
+    if (trees.size() == 0) {
+      return;
+    }
+    CHECK_EQ(gpair->Shape(1), 1) << MTNotImplemented();
+    const std::vector<GradientPair> &gpair_h = gpair->Data()->ConstHostVector();
+    // Thread local variables.
     std::vector<std::vector<GradStats> > stemp;
     std::vector<RegTree::FVec> fvec_temp;
     // setup temp space for each thread
@@ -58,9 +60,8 @@ class TreeRefresher : public TreeUpdater {
       });
     }
     exc.Rethrow();
-    // if it is C++11, use lazy evaluation for Allreduce,
-    // to gain speedup in recovery
-    auto lazy_get_stats = [&]() {
+
+    auto get_stats = [&]() {
       const MetaInfo &info = p_fmat->Info();
       // start accumulating statistics
       for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
@@ -79,7 +80,7 @@ class TreeRefresher : public TreeUpdater {
                      dmlc::BeginPtr(stemp[tid]) + offset);
             offset += tree->NumNodes();
           }
-          feats.Drop(inst);
+          feats.Drop();
         });
       }
       // aggregate the statistics
@@ -90,12 +91,17 @@ class TreeRefresher : public TreeUpdater {
         }
       });
     };
-    lazy_get_stats();
-    collective::Allreduce<collective::Operation::kSum>(&dmlc::BeginPtr(stemp[0])->sum_grad,
-                                                       stemp[0].size() * 2);
-    int offset = 0;
+    get_stats();
+    // Synchronize the aggregated result.
+    auto &sum_grad = stemp[0];
+    // x2 for gradient and hessian.
+    auto rc = collective::Allreduce(
+        ctx_, linalg::MakeVec(&sum_grad.data()->sum_grad, sum_grad.size() * 2),
+        collective::Op::kMax);
+    collective::SafeColl(rc);
+    bst_node_t offset = 0;
     for (auto tree : trees) {
-      this->Refresh(param, dmlc::BeginPtr(stemp[0]) + offset, 0, tree);
+      this->Refresh(param, dmlc::BeginPtr(sum_grad) + offset, 0, tree);
       offset += tree->NumNodes();
     }
   }

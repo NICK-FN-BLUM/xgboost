@@ -1,25 +1,6 @@
 /**
  * Copyright 2020-2023 by XGBoost contributors
  */
-// When device ordinal is present, we would want to build the metrics on the GPU. It is *not*
-// possible for a valid device ordinal to be present for non GPU builds. However, it is possible
-// for an invalid device ordinal to be specified in GPU builds - to train/predict and/or compute
-// the metrics on CPU. To accommodate these scenarios, the following is done for the metrics
-// accelerated on the GPU.
-// - An internal GPU registry holds all the GPU metric types (defined in the .cu file)
-// - An instance of the appropriate GPU metric type is created when a device ordinal is present
-// - If the creation is successful, the metric computation is done on the device
-// - else, it falls back on the CPU
-// - The GPU metric types are *only* registered when xgboost is built for GPUs
-//
-// This is done for 2 reasons:
-// - Clear separation of CPU and GPU logic
-// - Sorting datasets containing large number of rows is (much) faster when parallel sort
-//   semantics is used on the CPU. The __gnu_parallel/concurrency primitives needed to perform
-//   this cannot be used when the translation unit is compiled using the 'nvcc' compiler (as the
-//   corresponding headers that brings in those function declaration can't be included with CUDA).
-//   This precludes the CPU and GPU logic to coexist inside a .cu file
-
 #include "rank_metric.h"
 
 #include <dmlc/omp.h>
@@ -28,9 +9,8 @@
 #include <algorithm>                         // for stable_sort, copy, fill_n, min, max
 #include <array>                             // for array
 #include <cmath>                             // for log, sqrt
-#include <cstddef>                           // for size_t, std
-#include <cstdint>                           // for uint32_t
 #include <functional>                        // for less, greater
+#include <limits>                            // for numeric_limits
 #include <map>                               // for operator!=, _Rb_tree_const_iterator
 #include <memory>                            // for allocator, unique_ptr, shared_ptr, __shared_...
 #include <numeric>                           // for accumulate
@@ -39,15 +19,11 @@
 #include <utility>                           // for pair, make_pair
 #include <vector>                            // for vector
 
-#include "../collective/communicator-inl.h"  // for IsDistributed, Allreduce
-#include "../collective/communicator.h"      // for Operation
+#include "../collective/aggregator.h"        // for ApplyWithLabels
 #include "../common/algorithm.h"             // for ArgSort, Sort
 #include "../common/linalg_op.h"             // for cbegin, cend
 #include "../common/math.h"                  // for CmpFirst
 #include "../common/optional_weight.h"       // for OptionalWeights, MakeOptionalWeights
-#include "../common/ranking_utils.h"         // for LambdaRankParam, NDCGCache, ParseMetricName
-#include "../common/threading_utils.h"       // for ParallelFor
-#include "../common/transform_iterator.h"    // for IndexTransformIter
 #include "dmlc/common.h"                     // for OMPException
 #include "metric_common.h"                   // for MetricNoCache, GPUMetric, PackedReduceResult
 #include "xgboost/base.h"                    // for bst_float, bst_omp_uint, bst_group_t, Args
@@ -59,59 +35,11 @@
 #include "xgboost/linalg.h"                  // for Tensor, TensorView, Range, VectorView, MakeT...
 #include "xgboost/logging.h"                 // for CHECK, ConsoleLogger, LOG_INFO, CHECK_EQ
 #include "xgboost/metric.h"                  // for MetricReg, XGBOOST_REGISTER_METRIC, Metric
-#include "xgboost/span.h"                    // for Span, operator!=
 #include "xgboost/string_view.h"             // for StringView
 
 namespace {
-
 using PredIndPair = std::pair<xgboost::bst_float, xgboost::ltr::rel_degree_t>;
 using PredIndPairContainer = std::vector<PredIndPair>;
-
-/*
- * Adapter to access instance weights.
- *
- *  - For ranking task, weights are per-group
- *  - For binary classification task, weights are per-instance
- *
- * WeightPolicy::GetWeightOfInstance() :
- *   get weight associated with an individual instance, using index into
- *   `info.weights`
- * WeightPolicy::GetWeightOfSortedRecord() :
- *   get weight associated with an individual instance, using index into
- *   sorted records `rec` (in ascending order of predicted labels). `rec` is
- *   of type PredIndPairContainer
- */
-
-class PerInstanceWeightPolicy {
- public:
-  inline static xgboost::bst_float
-  GetWeightOfInstance(const xgboost::MetaInfo& info,
-                      unsigned instance_id, unsigned) {
-    return info.GetWeight(instance_id);
-  }
-  inline static xgboost::bst_float
-  GetWeightOfSortedRecord(const xgboost::MetaInfo& info,
-                          const PredIndPairContainer& rec,
-                          unsigned record_id, unsigned) {
-    return info.GetWeight(rec[record_id].second);
-  }
-};
-
-class PerGroupWeightPolicy {
- public:
-  inline static xgboost::bst_float
-  GetWeightOfInstance(const xgboost::MetaInfo& info,
-                      unsigned, unsigned group_id) {
-    return info.GetWeight(group_id);
-  }
-
-  inline static xgboost::bst_float
-  GetWeightOfSortedRecord(const xgboost::MetaInfo& info,
-                          const PredIndPairContainer&,
-                          unsigned, unsigned group_id) {
-    return info.GetWeight(group_id);
-  }
-};
 }  // anonymous namespace
 
 namespace xgboost::metric {
@@ -140,13 +68,14 @@ struct EvalAMS : public MetricNoCache {
     const auto &h_preds = preds.ConstHostVector();
     common::ParallelFor(ndata, ctx_->Threads(),
                         [&](bst_omp_uint i) { rec[i] = std::make_pair(h_preds[i], i); });
-    common::Sort(ctx_, rec.begin(), rec.end(), common::CmpFirst);
+    common::Sort(ctx_, rec.begin(), rec.end(),
+                 [](auto const& l, auto const& r) { return l.first > r.first; });
     auto ntop = static_cast<unsigned>(ratio_ * ndata);
     if (ntop == 0) ntop = ndata;
     const double br = 10.0;
     unsigned thresindex = 0;
     double s_tp = 0.0, b_fp = 0.0, tams = 0.0;
-    const auto& labels = info.labels.View(Context::kCpuId);
+    const auto& labels = info.labels.View(DeviceOrd::CPU());
     for (unsigned i = 0; i < static_cast<unsigned>(ndata-1) && i < ntop; ++i) {
       const unsigned ridx = rec[i].second;
       const bst_float wt = info.GetWeight(ridx);
@@ -172,7 +101,7 @@ struct EvalAMS : public MetricNoCache {
     }
   }
 
-  const char* Name() const override {
+  [[nodiscard]] const char* Name() const override {
     return name_.c_str();
   }
 
@@ -183,10 +112,6 @@ struct EvalAMS : public MetricNoCache {
 
 /*! \brief Evaluate rank list */
 struct EvalRank : public MetricNoCache, public EvalRankConfig {
- private:
-  // This is used to compute the ranking metrics on the GPU - for training jobs that run on the GPU.
-  std::unique_ptr<MetricNoCache> rank_gpu_;
-
  public:
   double Eval(const HostDeviceVector<bst_float>& preds, const MetaInfo& info) override {
     CHECK_EQ(preds.Size(), info.labels.Size())
@@ -205,21 +130,11 @@ struct EvalRank : public MetricNoCache, public EvalRankConfig {
     // sum statistics
     double sum_metric = 0.0f;
 
-    // Check and see if we have the GPU metric registered in the internal registry
-    if (ctx_->gpu_id >= 0) {
-      if (!rank_gpu_) {
-        rank_gpu_.reset(GPUMetric::CreateGPUMetric(this->Name(), ctx_));
-      }
-      if (rank_gpu_) {
-        sum_metric = rank_gpu_->Eval(preds, info);
-      }
-    }
-
     CHECK(ctx_);
     std::vector<double> sum_tloc(ctx_->Threads(), 0.0);
 
-    if (!rank_gpu_ || ctx_->gpu_id < 0) {
-      const auto& labels = info.labels.View(Context::kCpuId);
+    {
+      const auto& labels = info.labels.HostView();
       const auto &h_preds = preds.ConstHostVector();
 
       dmlc::OMPException exc;
@@ -244,17 +159,10 @@ struct EvalRank : public MetricNoCache, public EvalRankConfig {
       exc.Rethrow();
     }
 
-    if (collective::IsDistributed()) {
-      double dat[2]{sum_metric, static_cast<double>(ngroups)};
-      // approximately estimate the metric using mean
-      collective::Allreduce<collective::Operation::kSum>(dat, 2);
-      return dat[0] / dat[1];
-    } else {
-      return sum_metric / ngroups;
-    }
+    return collective::GlobalRatio(ctx_, info, sum_metric, static_cast<double>(ngroups));
   }
 
-  const char* Name() const override {
+  [[nodiscard]] const char* Name() const override {
     return name.c_str();
   }
 
@@ -264,23 +172,6 @@ struct EvalRank : public MetricNoCache, public EvalRankConfig {
   }
 
   virtual double EvalGroup(PredIndPairContainer *recptr) const = 0;
-};
-
-/*! \brief Precision at N, for both classification and rank */
-struct EvalPrecision : public EvalRank {
- public:
-  explicit EvalPrecision(const char* name, const char* param) : EvalRank(name, param) {}
-
-  double EvalGroup(PredIndPairContainer *recptr) const override {
-    PredIndPairContainer &rec(*recptr);
-    // calculate Precision
-    std::stable_sort(rec.begin(), rec.end(), common::CmpFirst);
-    unsigned nhit = 0;
-    for (size_t j = 0; j < rec.size() && j < this->topn; ++j) {
-      nhit += (rec[j].second != 0);
-    }
-    return static_cast<double>(nhit) / this->topn;
-  }
 };
 
 /*! \brief Cox: Partial likelihood of the Cox proportional hazards model */
@@ -325,7 +216,7 @@ struct EvalCox : public MetricNoCache {
     return out/num_events;  // normalize by the number of events
   }
 
-  const char* Name() const override {
+  [[nodiscard]] const char* Name() const override {
     return "cox-nloglik";
   }
 };
@@ -333,10 +224,6 @@ struct EvalCox : public MetricNoCache {
 XGBOOST_REGISTER_METRIC(AMS, "ams")
 .describe("AMS metric for higgs.")
 .set_body([](const char* param) { return new EvalAMS(param); });
-
-XGBOOST_REGISTER_METRIC(Precision, "pre")
-.describe("precision@k for rank.")
-.set_body([](const char* param) { return new EvalPrecision("pre", param); });
 
 XGBOOST_REGISTER_METRIC(Cox, "cox-nloglik")
 .describe("Negative log partial likelihood of Cox proportional hazards model.")
@@ -385,25 +272,33 @@ class EvalRankWithCache : public Metric {
   }
 
   double Evaluate(HostDeviceVector<float> const& preds, std::shared_ptr<DMatrix> p_fmat) override {
+    double result{0.0};
     auto const& info = p_fmat->Info();
-    auto p_cache = cache_.CacheItem(p_fmat, ctx_, info, param_);
-    if (p_cache->Param() != param_) {
-      p_cache = cache_.ResetItem(p_fmat, ctx_, info, param_);
-    }
-    CHECK(p_cache->Param() == param_);
-    CHECK_EQ(preds.Size(), info.labels.Size());
+    collective::ApplyWithLabels(ctx_, info, &result, sizeof(double), [&] {
+      auto p_cache = cache_.CacheItem(p_fmat, ctx_, info, param_);
+      if (p_cache->Param() != param_) {
+        p_cache = cache_.ResetItem(p_fmat, ctx_, info, param_);
+      }
+      CHECK(p_cache->Param() == param_);
+      CHECK_EQ(preds.Size(), info.labels.Size());
 
-    return this->Eval(preds, info, p_cache);
+      result = this->Eval(preds, info, p_cache);
+    });
+    return result;
   }
+
+  [[nodiscard]] const char* Name() const override { return name_.c_str(); }
 
   virtual double Eval(HostDeviceVector<float> const& preds, MetaInfo const& info,
                       std::shared_ptr<Cache> p_cache) = 0;
 };
 
 namespace {
-double Finalize(double score, double sw) {
+double Finalize(Context const* ctx, MetaInfo const& info, double score, double sw) {
   std::array<double, 2> dat{score, sw};
-  collective::Allreduce<collective::Operation::kSum>(dat.data(), dat.size());
+  auto rc = collective::GlobalSum(ctx, info, linalg::MakeVec(dat.data(), 2));
+  collective::SafeColl(rc);
+  std::tie(score, sw) = std::tuple_cat(dat);
   if (sw > 0.0) {
     score = score / sw;
   }
@@ -416,6 +311,51 @@ double Finalize(double score, double sw) {
 }
 }  // namespace
 
+class EvalPrecision : public EvalRankWithCache<ltr::PreCache> {
+ public:
+  using EvalRankWithCache::EvalRankWithCache;
+
+  double Eval(HostDeviceVector<float> const& predt, MetaInfo const& info,
+              std::shared_ptr<ltr::PreCache> p_cache) final {
+    auto n_groups = p_cache->Groups();
+    if (!info.weights_.Empty()) {
+      CHECK_EQ(info.weights_.Size(), n_groups) << error::GroupWeight();
+    }
+
+    if (ctx_->IsCUDA()) {
+      auto pre = cuda_impl::PreScore(ctx_, info, predt, p_cache);
+      return Finalize(ctx_, info, pre.Residue(), pre.Weights());
+    }
+
+    auto gptr = p_cache->DataGroupPtr(ctx_);
+    auto h_label = info.labels.HostView().Slice(linalg::All(), 0);
+    auto rank_idx = p_cache->SortedIdx(ctx_, predt.ConstHostSpan());
+
+    auto weight = common::MakeOptionalWeights(ctx_, info.weights_);
+    auto pre = p_cache->Pre(ctx_);
+
+    common::ParallelFor(p_cache->Groups(), ctx_->Threads(), [&](auto g) {
+      auto g_label = h_label.Slice(linalg::Range(gptr[g], gptr[g + 1]));
+      auto g_rank = rank_idx.subspan(gptr[g], gptr[g + 1] - gptr[g]);
+
+      auto n = std::min(static_cast<std::size_t>(param_.TopK()), g_label.Size());
+      double n_hits{0.0};
+      for (std::size_t i = 0; i < n; ++i) {
+        n_hits += g_label(g_rank[i]) * weight[g];
+      }
+      pre[g] = n_hits / static_cast<double>(n);
+    });
+
+    auto sw = 0.0;
+    for (std::size_t i = 0; i < pre.size(); ++i) {
+      sw += weight[i];
+    }
+
+    auto sum = std::accumulate(pre.cbegin(), pre.cend(), 0.0);
+    return Finalize(ctx_, info, sum, sw);
+  }
+};
+
 /**
  * \brief Implement the NDCG score function for learning to rank.
  *
@@ -424,13 +364,12 @@ double Finalize(double score, double sw) {
 class EvalNDCG : public EvalRankWithCache<ltr::NDCGCache> {
  public:
   using EvalRankWithCache::EvalRankWithCache;
-  const char* Name() const override { return name_.c_str(); }
 
   double Eval(HostDeviceVector<float> const& preds, MetaInfo const& info,
               std::shared_ptr<ltr::NDCGCache> p_cache) override {
     if (ctx_->IsCUDA()) {
       auto ndcg = cuda_impl::NDCGScore(ctx_, info, preds, minus_, p_cache);
-      return Finalize(ndcg.Residue(), ndcg.Weights());
+      return Finalize(ctx_, info, ndcg.Residue(), ndcg.Weights());
     }
 
     // group local ndcg
@@ -476,34 +415,31 @@ class EvalNDCG : public EvalRankWithCache<ltr::NDCGCache> {
       sum_w = std::accumulate(weights.weights.cbegin(), weights.weights.cend(), 0.0);
     }
     auto ndcg = std::accumulate(linalg::cbegin(ndcg_gloc), linalg::cend(ndcg_gloc), 0.0);
-    return Finalize(ndcg, sum_w);
+    return Finalize(ctx_, info, ndcg, sum_w);
   }
 };
 
 class EvalMAPScore : public EvalRankWithCache<ltr::MAPCache> {
  public:
   using EvalRankWithCache::EvalRankWithCache;
-  const char* Name() const override { return name_.c_str(); }
 
   double Eval(HostDeviceVector<float> const& predt, MetaInfo const& info,
               std::shared_ptr<ltr::MAPCache> p_cache) override {
     if (ctx_->IsCUDA()) {
       auto map = cuda_impl::MAPScore(ctx_, info, predt, minus_, p_cache);
-      return Finalize(map.Residue(), map.Weights());
+      return Finalize(ctx_, info, map.Residue(), map.Weights());
     }
 
     auto gptr = p_cache->DataGroupPtr(ctx_);
     auto h_label = info.labels.HostView().Slice(linalg::All(), 0);
-    auto h_predt = linalg::MakeTensorView(ctx_, &predt, predt.Size());
 
     auto map_gloc = p_cache->Map(ctx_);
     std::fill_n(map_gloc.data(), map_gloc.size(), 0.0);
     auto rank_idx = p_cache->SortedIdx(ctx_, predt.ConstHostSpan());
 
     common::ParallelFor(p_cache->Groups(), ctx_->Threads(), [&](auto g) {
-      auto g_predt = h_predt.Slice(linalg::Range(gptr[g], gptr[g + 1]));
       auto g_label = h_label.Slice(linalg::Range(gptr[g], gptr[g + 1]));
-      auto g_rank = rank_idx.subspan(gptr[g]);
+      auto g_rank = rank_idx.subspan(gptr[g], gptr[g + 1] - gptr[g]);
 
       auto n = std::min(static_cast<std::size_t>(param_.TopK()), g_label.Size());
       double n_hits{0.0};
@@ -532,9 +468,13 @@ class EvalMAPScore : public EvalRankWithCache<ltr::MAPCache> {
       sw += weight[i];
     }
     auto sum = std::accumulate(map_gloc.cbegin(), map_gloc.cend(), 0.0);
-    return Finalize(sum, sw);
+    return Finalize(ctx_, info, sum, sw);
   }
 };
+
+XGBOOST_REGISTER_METRIC(Precision, "pre")
+    .describe("precision@k for rank.")
+    .set_body([](const char* param) { return new EvalPrecision("pre", param); });
 
 XGBOOST_REGISTER_METRIC(EvalMAP, "map")
     .describe("map@k for ranking.")

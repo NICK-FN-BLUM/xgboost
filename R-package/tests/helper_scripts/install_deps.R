@@ -3,7 +3,6 @@
 ## inconsistent is found.
 pkgs <- c(
   ## CI
-  "caret",
   "pkgbuild",
   "roxygen2",
   "XML",
@@ -14,6 +13,9 @@ pkgs <- c(
   "rmarkdown",
   "ggplot2",
   "DiagrammeR",
+  "DiagrammeRsvg",
+  "rsvg",
+  "htmlwidgets",
   "Ckmeans.1d.dp",
   "vcd",
   "lintr",
@@ -21,6 +23,7 @@ pkgs <- c(
   "igraph",
   "float",
   "titanic",
+  "RhpcBLASctl",
   ## imports
   "Matrix",
   "methods",

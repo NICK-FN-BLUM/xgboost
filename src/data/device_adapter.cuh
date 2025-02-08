@@ -1,5 +1,5 @@
 /**
- *  Copyright 2019-2023 by XGBoost Contributors
+ *  Copyright 2019-2024, XGBoost Contributors
  * \file device_adapter.cuh
  */
 #ifndef XGBOOST_DATA_DEVICE_ADAPTER_H_
@@ -7,19 +7,16 @@
 #include <thrust/iterator/counting_iterator.h>  // for make_counting_iterator
 #include <thrust/logical.h>                     // for none_of
 
-#include <cstddef>                              // for size_t
+#include <cstddef>  // for size_t
 #include <limits>
-#include <memory>
 #include <string>
 
+#include "../common/cuda_context.cuh"
 #include "../common/device_helpers.cuh"
-#include "../common/math.h"
 #include "adapter.h"
 #include "array_interface.h"
 
-namespace xgboost {
-namespace data {
-
+namespace xgboost::data {
 class CudfAdapterBatch : public detail::NoMetaInfo {
   friend class CudfAdapter;
 
@@ -28,8 +25,8 @@ class CudfAdapterBatch : public detail::NoMetaInfo {
   CudfAdapterBatch(common::Span<ArrayInterface<1>> columns, size_t num_rows)
       : columns_(columns),
         num_rows_(num_rows) {}
-  size_t Size() const { return num_rows_ * columns_.size(); }
-  __device__ COOTuple GetElement(size_t idx) const {
+  [[nodiscard]] std::size_t Size() const { return num_rows_ * columns_.size(); }
+  [[nodiscard]] __device__ __forceinline__ COOTuple GetElement(size_t idx) const {
     size_t column_idx = idx % columns_.size();
     size_t row_idx = idx / columns_.size();
     auto const& column = columns_[column_idx];
@@ -39,8 +36,16 @@ class CudfAdapterBatch : public detail::NoMetaInfo {
     return {row_idx, column_idx, value};
   }
 
-  XGBOOST_DEVICE bst_row_t NumRows() const { return num_rows_; }
-  XGBOOST_DEVICE bst_row_t NumCols() const { return columns_.size(); }
+  [[nodiscard]] __device__ float GetElement(bst_idx_t ridx, bst_feature_t fidx) const {
+    auto const& column = columns_[fidx];
+    float value = column.valid.Data() == nullptr || column.valid.Check(ridx)
+                      ? column(ridx)
+                      : std::numeric_limits<float>::quiet_NaN();
+    return value;
+  }
+
+  [[nodiscard]] XGBOOST_DEVICE bst_idx_t NumRows() const { return num_rows_; }
+  [[nodiscard]] XGBOOST_DEVICE bst_idx_t NumCols() const { return columns_.size(); }
 
  private:
   common::Span<ArrayInterface<1>> columns_;
@@ -107,21 +112,22 @@ class CudfAdapter : public detail::SingleBatchDataIter<CudfAdapterBatch> {
     CHECK_EQ(typestr.size(), 3) << ArrayInterfaceErrors::TypestrFormat();
     std::vector<ArrayInterface<1>> columns;
     auto first_column = ArrayInterface<1>(get<Object const>(json_columns[0]));
-    num_rows_ = first_column.Shape(0);
+    num_rows_ = first_column.Shape<0>();
     if (num_rows_ == 0) {
       return;
     }
 
-    device_idx_ = dh::CudaGetPointerDevice(first_column.data);
-    CHECK_NE(device_idx_, Context::kCpuId);
-    dh::safe_cuda(cudaSetDevice(device_idx_));
+    device_ = DeviceOrd::CUDA(dh::CudaGetPointerDevice(first_column.data));
+    CHECK(device_.IsCUDA());
+    dh::safe_cuda(cudaSetDevice(device_.ordinal));
     for (auto& json_col : json_columns) {
       auto column = ArrayInterface<1>(get<Object const>(json_col));
+      n_bytes_ += column.ElementSize() * column.Shape<0>();
       columns.push_back(column);
-      num_rows_ = std::max(num_rows_, column.Shape(0));
-      CHECK_EQ(device_idx_, dh::CudaGetPointerDevice(column.data))
+      num_rows_ = std::max(num_rows_, column.Shape<0>());
+      CHECK_EQ(device_.ordinal, dh::CudaGetPointerDevice(column.data))
           << "All columns should use the same device.";
-      CHECK_EQ(num_rows_, column.Shape(0))
+      CHECK_EQ(num_rows_, column.Shape<0>())
           << "All columns should have same number of rows.";
     }
     columns_ = columns;
@@ -135,15 +141,17 @@ class CudfAdapter : public detail::SingleBatchDataIter<CudfAdapterBatch> {
     return batch_;
   }
 
-  size_t NumRows() const { return num_rows_; }
-  size_t NumColumns() const { return columns_.size(); }
-  int32_t DeviceIdx() const { return device_idx_; }
+  [[nodiscard]] std::size_t NumRows() const { return num_rows_; }
+  [[nodiscard]] std::size_t NumColumns() const { return columns_.size(); }
+  [[nodiscard]] DeviceOrd Device() const { return device_; }
+  [[nodiscard]] bst_idx_t SizeBytes() const { return  this->n_bytes_; }
 
  private:
   CudfAdapterBatch batch_;
   dh::device_vector<ArrayInterface<1>> columns_;
   size_t num_rows_{0};
-  int32_t device_idx_{Context::kCpuId};
+  bst_idx_t n_bytes_{0};
+  DeviceOrd device_{DeviceOrd::CPU()};
 };
 
 class CupyAdapterBatch : public detail::NoMetaInfo {
@@ -151,18 +159,23 @@ class CupyAdapterBatch : public detail::NoMetaInfo {
   CupyAdapterBatch() = default;
   explicit CupyAdapterBatch(ArrayInterface<2> array_interface)
     : array_interface_(std::move(array_interface)) {}
-  size_t Size() const {
-    return array_interface_.Shape(0) * array_interface_.Shape(1);
+  // The total number of elements.
+  [[nodiscard]] std::size_t Size() const {
+    return array_interface_.Shape<0>() * array_interface_.Shape<1>();
   }
-  __device__ COOTuple GetElement(size_t idx) const {
-    size_t column_idx = idx % array_interface_.Shape(1);
-    size_t row_idx = idx / array_interface_.Shape(1);
+  [[nodiscard]]__device__ COOTuple GetElement(size_t idx) const {
+    size_t column_idx = idx % array_interface_.Shape<1>();
+    size_t row_idx = idx / array_interface_.Shape<1>();
     float value = array_interface_(row_idx, column_idx);
     return {row_idx, column_idx, value};
   }
+  [[nodiscard]] __device__ float GetElement(bst_idx_t ridx, bst_feature_t fidx) const {
+    float value = array_interface_(ridx, fidx);
+    return value;
+  }
 
-  XGBOOST_DEVICE bst_row_t NumRows() const { return array_interface_.Shape(0); }
-  XGBOOST_DEVICE bst_row_t NumCols() const { return array_interface_.Shape(1); }
+  [[nodiscard]] XGBOOST_DEVICE bst_idx_t NumRows() const { return array_interface_.Shape<0>(); }
+  [[nodiscard]] XGBOOST_DEVICE bst_idx_t NumCols() const { return array_interface_.Shape<1>(); }
 
  private:
   ArrayInterface<2> array_interface_;
@@ -174,46 +187,73 @@ class CupyAdapter : public detail::SingleBatchDataIter<CupyAdapterBatch> {
     Json json_array_interface = Json::Load(cuda_interface_str);
     array_interface_ = ArrayInterface<2>(get<Object const>(json_array_interface));
     batch_ = CupyAdapterBatch(array_interface_);
-    if (array_interface_.Shape(0) == 0) {
+    if (array_interface_.Shape<0>() == 0) {
       return;
     }
-    device_idx_ = dh::CudaGetPointerDevice(array_interface_.data);
-    CHECK_NE(device_idx_, Context::kCpuId);
+    device_ = DeviceOrd::CUDA(dh::CudaGetPointerDevice(array_interface_.data));
+    this->n_bytes_ =
+        array_interface_.Shape<0>() * array_interface_.Shape<1>() * array_interface_.ElementSize();
+    CHECK(device_.IsCUDA());
   }
   explicit CupyAdapter(std::string cuda_interface_str)
       : CupyAdapter{StringView{cuda_interface_str}} {}
-  const CupyAdapterBatch& Value() const override { return batch_; }
+  [[nodiscard]] const CupyAdapterBatch& Value() const override { return batch_; }
 
-  size_t NumRows() const { return array_interface_.Shape(0); }
-  size_t NumColumns() const { return array_interface_.Shape(1); }
-  int32_t DeviceIdx() const { return device_idx_; }
+  [[nodiscard]] std::size_t NumRows() const { return array_interface_.Shape<0>(); }
+  [[nodiscard]] std::size_t NumColumns() const { return array_interface_.Shape<1>(); }
+  [[nodiscard]] DeviceOrd Device() const { return device_; }
+  [[nodiscard]] bst_idx_t SizeBytes() const { return  this->n_bytes_; }
 
  private:
   ArrayInterface<2> array_interface_;
   CupyAdapterBatch batch_;
-  int32_t device_idx_ {Context::kCpuId};
+  bst_idx_t n_bytes_{0};
+  DeviceOrd device_{DeviceOrd::CPU()};
 };
 
 // Returns maximum row length
 template <typename AdapterBatchT>
-size_t GetRowCounts(const AdapterBatchT batch, common::Span<size_t> offset,
-                    int device_idx, float missing) {
-  dh::safe_cuda(cudaSetDevice(device_idx));
+bst_idx_t GetRowCounts(Context const* ctx, const AdapterBatchT batch,
+                       common::Span<bst_idx_t> offset, DeviceOrd device, float missing) {
+  dh::safe_cuda(cudaSetDevice(device.ordinal));
   IsValidFunctor is_valid(missing);
+  dh::safe_cuda(
+      cudaMemsetAsync(offset.data(), '\0', offset.size_bytes(), ctx->CUDACtx()->Stream()));
+
+  auto n_samples = batch.NumRows();
+  bst_feature_t n_features = batch.NumCols();
+
+  // Use more than 1 threads for each row in case of dataset being too wide.
+  bst_feature_t stride{0};
+  if (n_features < 32) {
+    stride = std::min(n_features, 4u);
+  } else if (n_features < 64) {
+    stride = 8;
+  } else if (n_features < 128) {
+    stride = 16;
+  } else {
+    stride = 32;
+  }
+
   // Count elements per row
-  dh::LaunchN(batch.Size(), [=] __device__(size_t idx) {
-    auto element = batch.GetElement(idx);
-    if (is_valid(element)) {
-      atomicAdd(reinterpret_cast<unsigned long long*>(  // NOLINT
-                    &offset[element.row_idx]),
-                static_cast<unsigned long long>(1));  // NOLINT
+  dh::LaunchN(n_samples * stride, ctx->CUDACtx()->Stream(), [=] __device__(std::size_t idx) {
+    bst_idx_t cnt{0};
+    auto [ridx, fbeg] = linalg::UnravelIndex(idx, n_samples, stride);
+    SPAN_CHECK(ridx < n_samples);
+    for (bst_feature_t fidx = fbeg; fidx < n_features; fidx += stride) {
+      if (is_valid(batch.GetElement(ridx, fidx))) {
+        cnt++;
+      }
     }
+
+    atomicAdd(reinterpret_cast<unsigned long long*>(  // NOLINT
+                  &offset[ridx]),
+              static_cast<unsigned long long>(cnt));  // NOLINT
   });
-  dh::XGBCachingDeviceAllocator<char> alloc;
-  size_t row_stride =
-      dh::Reduce(thrust::cuda::par(alloc), thrust::device_pointer_cast(offset.data()),
+  bst_idx_t row_stride =
+      dh::Reduce(ctx->CUDACtx()->CTP(), thrust::device_pointer_cast(offset.data()),
                  thrust::device_pointer_cast(offset.data()) + offset.size(),
-                 static_cast<std::size_t>(0), thrust::maximum<size_t>());
+                 static_cast<bst_idx_t>(0), thrust::maximum<bst_idx_t>());
   return row_stride;
 }
 
@@ -221,15 +261,22 @@ size_t GetRowCounts(const AdapterBatchT batch, common::Span<size_t> offset,
  * \brief Check there's no inf in data.
  */
 template <typename AdapterBatchT>
-bool HasInfInData(AdapterBatchT const& batch, IsValidFunctor is_valid) {
+bool NoInfInData(Context const* ctx, AdapterBatchT const& batch, IsValidFunctor is_valid) {
   auto counting = thrust::make_counting_iterator(0llu);
-  auto value_iter = dh::MakeTransformIterator<float>(
-      counting, [=] XGBOOST_DEVICE(std::size_t idx) { return batch.GetElement(idx).value; });
-  auto valid =
-      thrust::none_of(value_iter, value_iter + batch.Size(),
-                      [is_valid] XGBOOST_DEVICE(float v) { return is_valid(v) && std::isinf(v); });
+  auto value_iter = dh::MakeTransformIterator<bool>(counting, [=] XGBOOST_DEVICE(std::size_t idx) {
+    auto v = batch.GetElement(idx).value;
+    if (is_valid(v) && isinf(v)) {
+      return false;
+    }
+    return true;
+  });
+  // The default implementation in thrust optimizes any_of/none_of/all_of by using small
+  // intervals to early stop. But we expect all data to be valid here, using small
+  // intervals only decreases performance due to excessive kernel launch and stream
+  // synchronization.
+  auto valid = dh::Reduce(ctx->CUDACtx()->CTP(), value_iter, value_iter + batch.Size(), true,
+                          thrust::logical_and<>{});
   return valid;
 }
-};  // namespace data
-}  // namespace xgboost
+}  // namespace xgboost::data
 #endif  // XGBOOST_DATA_DEVICE_ADAPTER_H_

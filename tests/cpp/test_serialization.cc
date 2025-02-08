@@ -60,7 +60,7 @@ void CompareJSON(Json l, Json r) {
     }
     break;
   }
-  case Value::ValueKind::kNumberArray: {
+  case Value::ValueKind::kF32Array: {
     auto const& l_arr = get<F32Array const>(l);
     auto const& r_arr = get<F32Array const>(r);
     ASSERT_EQ(l_arr.size(), r_arr.size());
@@ -69,8 +69,25 @@ void CompareJSON(Json l, Json r) {
     }
     break;
   }
+  case Value::ValueKind::kF64Array: {
+    auto const& l_arr = get<F64Array const>(l);
+    auto const& r_arr = get<F64Array const>(r);
+    ASSERT_EQ(l_arr.size(), r_arr.size());
+    for (size_t i = 0; i < l_arr.size(); ++i) {
+      ASSERT_NEAR(l_arr[i], r_arr[i], kRtEps);
+    }
+    break;
+  }
+  case Value::ValueKind::kI8Array: {
+    CompareIntArray<I8Array>(l, r);
+    break;
+  }
   case Value::ValueKind::kU8Array: {
     CompareIntArray<U8Array>(l, r);
+    break;
+  }
+  case Value::ValueKind::kI16Array: {
+    CompareIntArray<I16Array>(l, r);
     break;
   }
   case Value::ValueKind::kI32Array: {
@@ -203,12 +220,16 @@ void TestLearnerSerialization(Args args, FeatureMap const& fmap, std::shared_ptr
     learner->Save(&mem_out);
     ASSERT_EQ(model_at_kiter, serialised_model_tmp);
 
-    learner->SetParam("gpu_id", "0");
+    for (auto const& [key, value] : args) {
+      if (key == "tree_method" && value == "gpu_hist") {
+        learner->SetParam("gpu_id", "0");
+      }
+    }
     // Pull data to device
     for (auto &batch : p_dmat->GetBatches<SparsePage>()) {
-      batch.data.SetDevice(0);
+      batch.data.SetDevice(DeviceOrd::CUDA(0));
       batch.data.DeviceSpan();
-      batch.offset.SetDevice(0);
+      batch.offset.SetDevice(DeviceOrd::CUDA(0));
       batch.offset.DeviceSpan();
     }
 
@@ -694,10 +715,6 @@ TEST_F(MultiClassesSerializationTest, GpuHist) {
                             {"seed", "0"},
                             {"nthread", "1"},
                             {"max_depth", std::to_string(kClasses)},
-                            // Somehow rebuilding the cache can generate slightly
-                            // different result (1e-7) with CPU predictor for some
-                            // entries.
-                            {"predictor", "gpu_predictor"},
                             // Mitigate the difference caused by hardware fused multiply
                             // add to tree weight during update prediction cache.
                             {"learning_rate", "1.0"},

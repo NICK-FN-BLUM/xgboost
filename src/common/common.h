@@ -1,29 +1,26 @@
 /**
- * Copyright 2015-2023 by XGBoost Contributors
+ * Copyright 2015-2024, XGBoost Contributors
  * \file common.h
  * \brief Common utilities
  */
 #ifndef XGBOOST_COMMON_COMMON_H_
 #define XGBOOST_COMMON_COMMON_H_
 
-#include <xgboost/base.h>
-#include <xgboost/logging.h>
-#include <xgboost/span.h>
+#include <array>      // for array
+#include <cmath>      // for ceil
+#include <cstddef>    // for size_t
+#include <cstdint>    // for int32_t, int64_t
+#include <sstream>    // for basic_istream, operator<<, istringstream
+#include <string>     // for string, basic_string, getline, char_traits
+#include <tuple>      // for make_tuple
+#include <utility>    // for forward, index_sequence, make_index_sequence
+#include <vector>     // for vector
 
-#include <algorithm>
-#include <exception>
-#include <functional>
-#include <limits>
-#include <numeric>
-#include <sstream>
-#include <string>
-#include <type_traits>
-#include <utility>
-#include <vector>
+#include "xgboost/base.h"     // for XGBOOST_DEVICE
+#include "xgboost/logging.h"  // for LOG, LOG_FATAL, LogMessageFatal
 
+// magic to define functions based on the compiler.
 #if defined(__CUDACC__)
-#include <thrust/system/cuda/error.h>
-#include <thrust/system_error.h>
 
 #define WITH_CUDA() true
 
@@ -33,27 +30,23 @@
 
 #endif  // defined(__CUDACC__)
 
+#if defined(XGBOOST_USE_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+
 namespace dh {
-#if defined(__CUDACC__)
+#if defined(XGBOOST_USE_CUDA)
 /*
- * Error handling  functions
+ * Error handling functions
  */
+void ThrowOnCudaError(cudaError_t code, const char *file, int line);
+
 #define safe_cuda(ans) ThrowOnCudaError((ans), __FILE__, __LINE__)
 
-inline cudaError_t ThrowOnCudaError(cudaError_t code, const char *file,
-                                    int line) {
-  if (code != cudaSuccess) {
-    LOG(FATAL) << thrust::system_error(code, thrust::cuda_category(),
-                                       std::string{file} + ": " +  // NOLINT
-                                       std::to_string(line)).what();
-  }
-  return code;
-}
-#endif  // defined(__CUDACC__)
+#endif  // defined(XGBOOST_USE_CUDA)
 }  // namespace dh
 
-namespace xgboost {
-namespace common {
+namespace xgboost::common {
 /*!
  * \brief Split a string by delimiter
  * \param s String to be split.
@@ -69,17 +62,23 @@ inline std::vector<std::string> Split(const std::string& s, char delim) {
   return ret;
 }
 
+/**
+ * @brief Add escapes for a UTF-8 string.
+ */
+void EscapeU8(std::string const &string, std::string *p_buffer);
+
+/**
+ * @brief Add escapes for a UTF-8 string with newly created buffer as return.
+ */
+inline std::string EscapeU8(std::string const &str) {
+  std::string buffer;
+  EscapeU8(str, &buffer);
+  return buffer;
+}
+
 template <typename T>
 XGBOOST_DEVICE T Max(T a, T b) {
   return a < b ? b : a;
-}
-
-// simple routine to convert any data to string
-template<typename T>
-inline std::string ToString(const T& data) {
-  std::ostringstream os;
-  os << data;
-  return os.str();
 }
 
 template <typename T1, typename T2>
@@ -164,37 +163,33 @@ class Range {
   Iterator end_;
 };
 
-int AllVisibleGPUs();
-
 inline void AssertGPUSupport() {
 #ifndef XGBOOST_USE_CUDA
     LOG(FATAL) << "XGBoost version not compiled with GPU support.";
 #endif  // XGBOOST_USE_CUDA
 }
 
-inline void AssertOneAPISupport() {
-#ifndef XGBOOST_USE_ONEAPI
-    LOG(FATAL) << "XGBoost version not compiled with OneAPI support.";
-#endif  // XGBOOST_USE_ONEAPI
+inline void AssertNCCLSupport() {
+#if !defined(XGBOOST_USE_NCCL)
+    LOG(FATAL) << "XGBoost version not compiled with NCCL support.";
+#endif  // !defined(XGBOOST_USE_NCCL)
 }
 
-void SetDevice(std::int32_t device);
-
-#if !defined(XGBOOST_USE_CUDA)
-inline void SetDevice(std::int32_t device) {
-  if (device >= 0) {
-    AssertGPUSupport();
-  }
+inline void AssertSYCLSupport() {
+#ifndef XGBOOST_USE_SYCL
+    LOG(FATAL) << "XGBoost version not compiled with SYCL support.";
+#endif  // XGBOOST_USE_SYCL
 }
-#endif
 
 /**
- * Last index of a group in a CSR style of index pointer.
+ * @brief Last index of a group in a CSR style of index pointer.
  */
 template <typename Indexable>
 XGBOOST_DEVICE size_t LastOf(size_t group, Indexable const &indptr) {
   return indptr[group + 1] - 1;
 }
-}  // namespace common
-}  // namespace xgboost
+
+// Convert the number of bytes to a human readable unit.
+std::string HumanMemUnit(std::size_t n_bytes);
+}  // namespace xgboost::common
 #endif  // XGBOOST_COMMON_COMMON_H_

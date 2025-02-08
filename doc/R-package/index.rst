@@ -14,15 +14,14 @@ Get Started
 ***********
 * Checkout the :doc:`Installation Guide </install>` contains instructions to install xgboost, and :doc:`Tutorials </tutorials/index>` for examples on how to use XGBoost for various tasks.
 * Read the `API documentation <https://cran.r-project.org/web/packages/xgboost/xgboost.pdf>`_.
-* Please visit `Walk-through Examples <https://github.com/dmlc/xgboost/tree/master/R-package/demo>`_.
 
-*********
-Tutorials
-*********
+************
+Other topics
+************
 
 .. toctree::
   :maxdepth: 2
   :titlesonly:
 
-  Introduction to XGBoost in R <xgboostPresentation>
-  Understanding your dataset with XGBoost <discoverYourData>
+  Handling of indexable elements <index_base>
+  Developer guide: parameters from core library <adding_parameters>

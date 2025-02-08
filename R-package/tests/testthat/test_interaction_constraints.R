@@ -2,6 +2,8 @@ require(xgboost)
 
 context("interaction constraints")
 
+n_threads <- 2
+
 set.seed(1024)
 x1 <- rnorm(1000, 1)
 x2 <- rnorm(1000, 1)
@@ -11,9 +13,16 @@ train <- matrix(c(x1, x2, x3), ncol = 3)
 
 test_that("interaction constraints for regression", {
   # Fit a model that only allows interaction between x1 and x2
-  bst <- xgboost(data = train, label = y, max_depth = 3,
-                 eta = 0.1, nthread = 2, nrounds = 100, verbose = 0,
-                 interaction_constraints = list(c(0, 1)))
+  bst <- xgb.train(
+    data = xgb.DMatrix(train, label = y),
+    nrounds = 100, verbose = 0,
+    params = xgb.params(
+      max_depth = 3,
+      learning_rate = 0.1,
+      nthread = 2,
+      interaction_constraints = list(c(0, 1))
+    )
+  )
 
   # Set all observations to have the same x3 values then increment
   #  by the same amount
@@ -45,11 +54,25 @@ test_that("interaction constraints scientific representation", {
   d <- matrix(rexp(rows, rate = .1), nrow = rows, ncol = cols)
   y <- rnorm(rows)
 
-  dtrain <- xgb.DMatrix(data = d, info = list(label = y))
+  dtrain <- xgb.DMatrix(data = d, label = y, nthread = n_threads)
   inc <- list(c(seq.int(from = 0, to = cols, by = 1)))
 
-  with_inc <- xgb.train(data = dtrain, tree_method = 'hist',
-                        interaction_constraints = inc, nrounds = 10)
-  without_inc <- xgb.train(data = dtrain, tree_method = 'hist', nrounds = 10)
+  with_inc <- xgb.train(
+    data = dtrain,
+    nrounds = 10,
+    params = xgb.params(
+      tree_method = 'hist',
+      interaction_constraints = inc,
+      nthread = n_threads
+    )
+  )
+  without_inc <- xgb.train(
+    data = dtrain,
+    nrounds = 10,
+    params = xgb.params(
+      tree_method = 'hist',
+      nthread = n_threads
+    )
+  )
   expect_equal(xgb.save.raw(with_inc), xgb.save.raw(without_inc))
 })

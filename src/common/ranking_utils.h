@@ -12,7 +12,7 @@
 #include <vector>                        // for vector
 
 #include "dmlc/parameter.h"              // for FieldEntry, DMLC_DECLARE_FIELD
-#include "error_msg.h"                   // for GroupWeight, GroupSize
+#include "error_msg.h"                   // for GroupWeight, GroupSize, InvalidCUDAOrdinal
 #include "xgboost/base.h"                // for XGBOOST_DEVICE, bst_group_t
 #include "xgboost/context.h"             // for Context
 #include "xgboost/data.h"                // for MetaInfo
@@ -70,7 +70,7 @@ struct LambdaRankParam : public XGBoostParameter<LambdaRankParam> {
   // pairs
   // should be accessed by getter for auto configuration.
   // nolint so that we can keep the string name.
-  PairMethod lambdarank_pair_method{PairMethod::kMean};  // NOLINT
+  PairMethod lambdarank_pair_method{PairMethod::kTopK};  // NOLINT
   std::size_t lambdarank_num_pair_per_sample{NotSet()};  // NOLINT
 
  public:
@@ -78,7 +78,8 @@ struct LambdaRankParam : public XGBoostParameter<LambdaRankParam> {
 
   // unbiased
   bool lambdarank_unbiased{false};
-  double lambdarank_bias_norm{2.0};
+  bool lambdarank_normalization{true};
+  double lambdarank_bias_norm{1.0};
   // ndcg
   bool ndcg_exp_gain{true};
 
@@ -86,6 +87,7 @@ struct LambdaRankParam : public XGBoostParameter<LambdaRankParam> {
     return lambdarank_pair_method == that.lambdarank_pair_method &&
            lambdarank_num_pair_per_sample == that.lambdarank_num_pair_per_sample &&
            lambdarank_unbiased == that.lambdarank_unbiased &&
+           lambdarank_normalization == that.lambdarank_normalization &&
            lambdarank_bias_norm == that.lambdarank_bias_norm && ndcg_exp_gain == that.ndcg_exp_gain;
   }
   bool operator!=(LambdaRankParam const& that) const { return !(*this == that); }
@@ -134,8 +136,11 @@ struct LambdaRankParam : public XGBoostParameter<LambdaRankParam> {
     DMLC_DECLARE_FIELD(lambdarank_unbiased)
         .set_default(false)
         .describe("Unbiased lambda mart. Use extended IPW to debias click position");
+    DMLC_DECLARE_FIELD(lambdarank_normalization)
+        .set_default(true)
+        .describe("Whether to normalize the leaf value for lambda rank.");
     DMLC_DECLARE_FIELD(lambdarank_bias_norm)
-        .set_default(2.0)
+        .set_default(1.0)
         .set_lower_bound(0.0)
         .describe("Lp regularization for unbiased lambdarank.");
     DMLC_DECLARE_FIELD(ndcg_exp_gain)
@@ -197,10 +202,10 @@ class RankingCache {
       CHECK_EQ(info.group_ptr_.back(), info.labels.Size())
           << error::GroupSize() << "the size of label.";
     }
-    if (ctx->IsCPU()) {
-      this->InitOnCPU(ctx, info);
-    } else {
+    if (ctx->IsCUDA()) {
       this->InitOnCUDA(ctx, info);
+    } else {
+      this->InitOnCPU(ctx, info);
     }
     if (!info.weights_.Empty()) {
       CHECK_EQ(Groups(), info.weights_.Size()) << error::GroupWeight();
@@ -217,8 +222,8 @@ class RankingCache {
   }
   // Constructed as [1, n_samples] if group ptr is not supplied by the user
   common::Span<bst_group_t const> DataGroupPtr(Context const* ctx) const {
-    group_ptr_.SetDevice(ctx->gpu_id);
-    return ctx->IsCPU() ? group_ptr_.ConstHostSpan() : group_ptr_.ConstDeviceSpan();
+    group_ptr_.SetDevice(ctx->Device());
+    return ctx->IsCUDA() ? group_ptr_.ConstDeviceSpan() : group_ptr_.ConstHostSpan();
   }
 
   [[nodiscard]] auto const& Param() const { return param_; }
@@ -228,29 +233,29 @@ class RankingCache {
   // Create a rank list by model prediction
   common::Span<std::size_t const> SortedIdx(Context const* ctx, common::Span<float const> predt) {
     if (sorted_idx_cache_.Empty()) {
-      sorted_idx_cache_.SetDevice(ctx->gpu_id);
+      sorted_idx_cache_.SetDevice(ctx->Device());
       sorted_idx_cache_.Resize(predt.size());
     }
-    if (ctx->IsCPU()) {
-      return this->MakeRankOnCPU(ctx, predt);
-    } else {
+    if (ctx->IsCUDA()) {
       return this->MakeRankOnCUDA(ctx, predt);
+    } else {
+      return this->MakeRankOnCPU(ctx, predt);
     }
   }
   // The function simply returns a uninitialized buffer as this is only used by the
   // objective for creating pairs.
   common::Span<std::size_t> SortedIdxY(Context const* ctx, std::size_t n_samples) {
-    CHECK(ctx->IsCUDA());
+    CHECK(ctx->IsCUDA()) << error::InvalidCUDAOrdinal();
     if (y_sorted_idx_cache_.Empty()) {
-      y_sorted_idx_cache_.SetDevice(ctx->gpu_id);
+      y_sorted_idx_cache_.SetDevice(ctx->Device());
       y_sorted_idx_cache_.Resize(n_samples);
     }
     return y_sorted_idx_cache_.DeviceSpan();
   }
   common::Span<float> RankedY(Context const* ctx, std::size_t n_samples) {
-    CHECK(ctx->IsCUDA());
+    CHECK(ctx->IsCUDA()) << error::InvalidCUDAOrdinal();
     if (y_ranked_by_model_.Empty()) {
-      y_ranked_by_model_.SetDevice(ctx->gpu_id);
+      y_ranked_by_model_.SetDevice(ctx->Device());
       y_ranked_by_model_.Resize(n_samples);
     }
     return y_ranked_by_model_.DeviceSpan();
@@ -266,21 +271,21 @@ class RankingCache {
 
   linalg::VectorView<GradientPair> CUDARounding(Context const* ctx) {
     if (roundings_.Size() == 0) {
-      roundings_.SetDevice(ctx->gpu_id);
+      roundings_.SetDevice(ctx->Device());
       roundings_.Reshape(Groups());
     }
-    return roundings_.View(ctx->gpu_id);
+    return roundings_.View(ctx->Device());
   }
   common::Span<double> CUDACostRounding(Context const* ctx) {
     if (cost_rounding_.Size() == 0) {
-      cost_rounding_.SetDevice(ctx->gpu_id);
+      cost_rounding_.SetDevice(ctx->Device());
       cost_rounding_.Resize(1);
     }
     return cost_rounding_.DeviceSpan();
   }
   template <typename Type>
   common::Span<Type> MaxLambdas(Context const* ctx, std::size_t n) {
-    max_lambdas_.SetDevice(ctx->gpu_id);
+    max_lambdas_.SetDevice(ctx->Device());
     std::size_t bytes = n * sizeof(Type);
     if (bytes != max_lambdas_.Size()) {
       max_lambdas_.Resize(bytes);
@@ -307,25 +312,27 @@ class NDCGCache : public RankingCache {
  public:
   NDCGCache(Context const* ctx, MetaInfo const& info, LambdaRankParam const& p)
       : RankingCache{ctx, info, p} {
-    if (ctx->IsCPU()) {
-      this->InitOnCPU(ctx, info);
-    } else {
+    if (ctx->IsCUDA()) {
       this->InitOnCUDA(ctx, info);
+    } else {
+      this->InitOnCPU(ctx, info);
     }
   }
 
   linalg::VectorView<double const> InvIDCG(Context const* ctx) const {
-    return inv_idcg_.View(ctx->gpu_id);
+  // This function doesn't have sycl-specific implementation yet.
+  // For that reason we transfer data to host in case of sycl is used for propper execution.
+    return inv_idcg_.View(ctx->Device().IsSycl() ? DeviceOrd::CPU() : ctx->Device());
   }
   common::Span<double const> Discount(Context const* ctx) const {
-    return ctx->IsCPU() ? discounts_.ConstHostSpan() : discounts_.ConstDeviceSpan();
+    return ctx->IsCUDA() ? discounts_.ConstDeviceSpan() : discounts_.ConstHostSpan();
   }
   linalg::VectorView<double> Dcg(Context const* ctx) {
     if (dcg_.Size() == 0) {
-      dcg_.SetDevice(ctx->gpu_id);
+      dcg_.SetDevice(ctx->Device());
       dcg_.Reshape(this->Groups());
     }
-    return dcg_.View(ctx->gpu_id);
+    return dcg_.View(ctx->Device().IsSycl() ? DeviceOrd::CPU() : ctx->Device());
   }
 };
 
@@ -366,17 +373,42 @@ bool IsBinaryRel(linalg::VectorView<float const> label, AllOf all_of) {
   });
 }
 /**
- * \brief Validate label for MAP
+ * \brief Validate label for precision-based metric.
  *
  * \tparam Implementation of std::all_of. Specified as a parameter to reuse the check for
  *         both CPU and GPU.
  */
 template <typename AllOf>
-void CheckMapLabels(linalg::VectorView<float const> label, AllOf all_of) {
+void CheckPreLabels(StringView name, linalg::VectorView<float const> label, AllOf all_of) {
   auto s_label = label.Values();
   auto is_binary = IsBinaryRel(label, all_of);
-  CHECK(is_binary) << "MAP can only be used with binary labels.";
+  CHECK(is_binary) << name << " can only be used with binary labels.";
 }
+
+class PreCache : public RankingCache {
+  HostDeviceVector<double> pre_;
+
+  void InitOnCPU(Context const* ctx, MetaInfo const& info);
+  void InitOnCUDA(Context const* ctx, MetaInfo const& info);
+
+ public:
+  PreCache(Context const* ctx, MetaInfo const& info, LambdaRankParam const& p)
+      : RankingCache{ctx, info, p} {
+    if (ctx->IsCUDA()) {
+      this->InitOnCUDA(ctx, info);
+    } else {
+      this->InitOnCPU(ctx, info);
+    }
+  }
+
+  common::Span<double> Pre(Context const* ctx) {
+    if (pre_.Empty()) {
+      pre_.SetDevice(ctx->Device());
+      pre_.Resize(this->Groups());
+    }
+    return ctx->IsCUDA() ? pre_.DeviceSpan() : pre_.HostSpan();
+  }
+};
 
 class MAPCache : public RankingCache {
   // Total number of relevant documents for each group
@@ -393,33 +425,33 @@ class MAPCache : public RankingCache {
  public:
   MAPCache(Context const* ctx, MetaInfo const& info, LambdaRankParam const& p)
       : RankingCache{ctx, info, p}, n_samples_{static_cast<std::size_t>(info.num_row_)} {
-    if (ctx->IsCPU()) {
-      this->InitOnCPU(ctx, info);
-    } else {
+    if (ctx->IsCUDA()) {
       this->InitOnCUDA(ctx, info);
+    } else {
+      this->InitOnCPU(ctx, info);
     }
   }
 
   common::Span<double> NumRelevant(Context const* ctx) {
     if (n_rel_.Empty()) {
-      n_rel_.SetDevice(ctx->gpu_id);
+      n_rel_.SetDevice(ctx->Device());
       n_rel_.Resize(n_samples_);
     }
-    return ctx->IsCPU() ? n_rel_.HostSpan() : n_rel_.DeviceSpan();
+    return ctx->IsCUDA() ? n_rel_.DeviceSpan() : n_rel_.HostSpan();
   }
   common::Span<double> Acc(Context const* ctx) {
     if (acc_.Empty()) {
-      acc_.SetDevice(ctx->gpu_id);
+      acc_.SetDevice(ctx->Device());
       acc_.Resize(n_samples_);
     }
-    return ctx->IsCPU() ? acc_.HostSpan() : acc_.DeviceSpan();
+    return ctx->IsCUDA() ? acc_.DeviceSpan() : acc_.HostSpan();
   }
   common::Span<double> Map(Context const* ctx) {
     if (map_.Empty()) {
-      map_.SetDevice(ctx->gpu_id);
+      map_.SetDevice(ctx->Device());
       map_.Resize(this->Groups());
     }
-    return ctx->IsCPU() ? map_.HostSpan() : map_.DeviceSpan();
+    return ctx->IsCUDA() ? map_.DeviceSpan() : map_.HostSpan();
   }
 };
 

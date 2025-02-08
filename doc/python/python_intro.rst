@@ -63,7 +63,7 @@ The input data is stored in a :py:class:`DMatrix <xgboost.DMatrix>` object. For 
 
   .. code-block:: python
 
-    dtrain = xgb.DMatrix('train.svm.txt')
+    dtrain = xgb.DMatrix('train.svm.txt?format=libsvm')
     dtrain.save_binary('train.buffer')
 
 * Missing values can be replaced by a default value in the :py:class:`DMatrix <xgboost.DMatrix>` constructor:
@@ -86,7 +86,7 @@ to number of groups.
 
   .. code-block:: python
 
-    dtrain = xgb.DMatrix('train.svm.txt')
+    dtrain = xgb.DMatrix('train.svm.txt?format=libsvm')
     dtest = xgb.DMatrix('test.svm.buffer')
 
   The parser in XGBoost has limited functionality. When using Python interface, it's
@@ -118,6 +118,7 @@ Markers
 - F: Not supported.
 - NE: Invalid type for the use case. For instance, `pd.Series` can not be multi-target label.
 - NPA: Support with the help of numpy array.
+- AT: Support with the help of arrow table.
 - CPA: Support with the help of cupy array.
 - SciCSR: Support with the help of scripy sparse CSR. The conversion to scipy CSR may or may not be possible. Raise a type error if conversion fails.
 - FF: We can look forward to having its support in recent future if requested.
@@ -162,24 +163,31 @@ Support Matrix
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
 | cupy.ndarray            | T         | T                 | T         | T         | T                  | T           |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
+| torch.Tensor            | T         | T                 | T         | T         | T                  | T           |
++-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
 | dlpack                  | CPA       | CPA               |           | CPA       | FF                 | FF          |
-+-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
-| datatable.Frame         | T         | FF                |           | NPA       | FF                 |             |
-+-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
-| datatable.Table         | T         | FF                |           | NPA       | FF                 |             |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
 | modin.DataFrame         | NPA       | FF                | NPA       | NPA       | FF                 |             |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
 | modin.Series            | NPA       | FF                | NPA       | NPA       | FF                 |             |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
-| pyarrow.Table           | T         | F                 |           | NPA       | FF                 |             |
+| pyarrow.Table           | T         | T                 | T         | T         | T                  | T           |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
-| pyarrow.dataset.Dataset | T         | F                 |           |           | F                  |             |
+| polars.DataFrame        | AT        | AT                | AT        | AT        | AT                 | AT          |
++-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
+| polars.LazyFrame (WARN) | AT        | AT                | AT        | AT        | AT                 | AT          |
++-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
+| polars.Series           | AT        | AT                | AT        | AT        | AT                 | NE          |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
 | _\_array\_\_            | NPA       | F                 | NPA       | NPA       | H                  |             |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
 | Others                  | SciCSR    | F                 |           | F         | F                  |             |
 +-------------------------+-----------+-------------------+-----------+-----------+--------------------+-------------+
+
+The polars ``LazyFrame.collect`` supports many configurations, ranging from the choice of
+query engine to type coercion. XGBoost simply uses the default parameter. Please run
+``collect`` to obtain the ``DataFrame`` before passing it into XGBoost for finer control
+over the behaviour.
 
 Setting Parameters
 ------------------
@@ -239,7 +247,7 @@ A saved model can be loaded as follows:
 .. code-block:: python
 
   bst = xgb.Booster({'nthread': 4})  # init model
-  bst.load_model('model.bin')  # load data
+  bst.load_model('model.bin')  # load model data
 
 Methods including `update` and `boost` from `xgboost.Booster` are designed for
 internal usage only.  The wrapper function `xgboost.train` does some
@@ -310,8 +318,8 @@ for more info.
 
 .. code-block:: python
 
-  # Use "gpu_hist" for training the model.
-  reg = xgb.XGBRegressor(tree_method="gpu_hist")
+  # Use "hist" for training the model.
+  reg = xgb.XGBRegressor(tree_method="hist", device="cuda")
   # Fit the model using predictor X and response y.
   reg.fit(X, y)
   # Save model into JSON format.

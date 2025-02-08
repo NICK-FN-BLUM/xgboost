@@ -20,7 +20,7 @@ sklearn estimator interface is still working in progress.
 
 You can find some some quick start examples at
 :ref:`sphx_glr_python_examples_sklearn_examples.py`. The main advantage of using sklearn
-interface is that it works with most of the utilites provided by sklearn like
+interface is that it works with most of the utilities provided by sklearn like
 :py:func:`sklearn.model_selection.cross_validate`. Also, many other libraries recognize
 the sklearn estimator interface thanks to its popularity.
 
@@ -62,7 +62,7 @@ stack of trees:
 .. code-block:: python
 
     early_stop = xgb.callback.EarlyStopping(
-        rounds=2, metric_name='logloss', data_name='Validation_0', save_best=True
+        rounds=2, metric_name='logloss', data_name='validation_0', save_best=True
     )
     clf = xgb.XGBClassifier(tree_method="hist", callbacks=[early_stop])
     clf.fit(X_train, y_train, eval_set=[(X_test, y_test)])
@@ -104,7 +104,7 @@ using cross validation with early stopping, here is a snippet to begin with:
 
     clf = xgb.XGBClassifier(tree_method="hist", early_stopping_rounds=3)
 
-    resutls = {}
+    results = {}
 
     for train, test in cv.split(X, y):
         X_train = X[train]
@@ -114,7 +114,7 @@ using cross validation with early stopping, here is a snippet to begin with:
         est, train_score, test_score = fit_and_score(
             clone(clf), X_train, X_test, y_train, y_test
         )
-        resutls[est] = (train_score, test_score)
+        results[est] = (train_score, test_score)
 
 
 ***********************************

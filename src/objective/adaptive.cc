@@ -1,20 +1,20 @@
 /**
- * Copyright 2022-2023 by XGBoost Contributors
+ * Copyright 2022-2024, XGBoost Contributors
  */
 #include "adaptive.h"
 
-#include <algorithm>                       // std::transform,std::find_if,std::copy,std::unique
-#include <cmath>                           // std::isnan
-#include <cstddef>                         // std::size_t
-#include <iterator>                        // std::distance
-#include <vector>                          // std::vector
+#include <algorithm>  // std::transform,std::find_if,std::copy,std::unique
+#include <cmath>      // std::isnan
+#include <cstddef>    // std::size_t
+#include <iterator>   // std::distance
+#include <vector>     // std::vector
 
 #include "../common/algorithm.h"           // ArgSort
-#include "../common/common.h"              // AssertGPUSupport
 #include "../common/numeric.h"             // RunLengthEncode
 #include "../common/stats.h"               // Quantile,WeightedQuantile
 #include "../common/threading_utils.h"     // ParallelFor
 #include "../common/transform_iterator.h"  // MakeIndexTransformIter
+#include "../tree/sample_position.h"       // for SamplePosition
 #include "xgboost/base.h"                  // bst_node_t
 #include "xgboost/context.h"               // Context
 #include "xgboost/data.h"                  // MetaInfo
@@ -22,6 +22,10 @@
 #include "xgboost/linalg.h"                // MakeTensorView
 #include "xgboost/span.h"                  // Span
 #include "xgboost/tree_model.h"            // RegTree
+
+#if !defined(XGBOOST_USE_CUDA)
+#include "../common/common.h"  // AssertGPUSupport
+#endif                         // !defined(XGBOOST_USE_CUDA)
 
 namespace xgboost::obj::detail {
 void EncodeTreeLeafHost(Context const* ctx, RegTree const& tree,
@@ -37,9 +41,10 @@ void EncodeTreeLeafHost(Context const* ctx, RegTree const& tree,
     sorted_pos[i] = position[ridx[i]];
   }
   // find the first non-sampled row
-  size_t begin_pos =
-      std::distance(sorted_pos.cbegin(), std::find_if(sorted_pos.cbegin(), sorted_pos.cend(),
-                                                      [](bst_node_t nidx) { return nidx >= 0; }));
+  size_t begin_pos = std::distance(
+      sorted_pos.cbegin(),
+      std::find_if(sorted_pos.cbegin(), sorted_pos.cend(),
+                   [](bst_node_t nidx) { return tree::SamplePosition::IsValid(nidx); }));
   CHECK_LE(begin_pos, sorted_pos.size());
 
   std::vector<bst_node_t> leaf;
@@ -85,7 +90,7 @@ void UpdateTreeLeafHost(Context const* ctx, std::vector<bst_node_t> const& posit
   size_t n_leaf = nidx.size();
   if (nptr.empty()) {
     std::vector<float> quantiles;
-    UpdateLeafValues(&quantiles, nidx, learning_rate, p_tree);
+    UpdateLeafValues(ctx, &quantiles, nidx, info, learning_rate, p_tree);
     return;
   }
 
@@ -99,39 +104,42 @@ void UpdateTreeLeafHost(Context const* ctx, std::vector<bst_node_t> const& posit
   auto h_predt = linalg::MakeTensorView(ctx, predt.ConstHostSpan(), info.num_row_,
                                         predt.Size() / info.num_row_);
 
-  // loop over each leaf
-  common::ParallelFor(quantiles.size(), ctx->Threads(), [&](size_t k) {
-    auto nidx = h_node_idx[k];
-    CHECK(tree[nidx].IsLeaf());
-    CHECK_LT(k + 1, h_node_ptr.size());
-    size_t n = h_node_ptr[k + 1] - h_node_ptr[k];
-    auto h_row_set = common::Span<size_t const>{ridx}.subspan(h_node_ptr[k], n);
+  collective::ApplyWithLabels(
+      ctx, info, static_cast<void*>(quantiles.data()), quantiles.size() * sizeof(float), [&] {
+        // loop over each leaf
+        common::ParallelFor(quantiles.size(), ctx->Threads(), [&](size_t k) {
+          auto nidx = h_node_idx[k];
+          CHECK(tree[nidx].IsLeaf());
+          CHECK_LT(k + 1, h_node_ptr.size());
+          size_t n = h_node_ptr[k + 1] - h_node_ptr[k];
+          auto h_row_set = common::Span<size_t const>{ridx}.subspan(h_node_ptr[k], n);
 
-    auto h_labels = info.labels.HostView().Slice(linalg::All(), IdxY(info, group_idx));
-    auto h_weights = linalg::MakeVec(&info.weights_);
+          auto h_labels = info.labels.HostView().Slice(linalg::All(), IdxY(info, group_idx));
+          auto h_weights = linalg::MakeVec(&info.weights_);
 
-    auto iter = common::MakeIndexTransformIter([&](size_t i) -> float {
-      auto row_idx = h_row_set[i];
-      return h_labels(row_idx) - h_predt(row_idx, group_idx);
-    });
-    auto w_it = common::MakeIndexTransformIter([&](size_t i) -> float {
-      auto row_idx = h_row_set[i];
-      return h_weights(row_idx);
-    });
+          auto iter = common::MakeIndexTransformIter([&](size_t i) -> float {
+            auto row_idx = h_row_set[i];
+            return h_labels(row_idx) - h_predt(row_idx, group_idx);
+          });
+          auto w_it = common::MakeIndexTransformIter([&](size_t i) -> float {
+            auto row_idx = h_row_set[i];
+            return h_weights(row_idx);
+          });
 
-    float q{0};
-    if (info.weights_.Empty()) {
-      q = common::Quantile(ctx, alpha, iter, iter + h_row_set.size());
-    } else {
-      q = common::WeightedQuantile(ctx, alpha, iter, iter + h_row_set.size(), w_it);
-    }
-    if (std::isnan(q)) {
-      CHECK(h_row_set.empty());
-    }
-    quantiles.at(k) = q;
-  });
+          float q{0};
+          if (info.weights_.Empty()) {
+            q = common::Quantile(ctx, alpha, iter, iter + h_row_set.size());
+          } else {
+            q = common::WeightedQuantile(ctx, alpha, iter, iter + h_row_set.size(), w_it);
+          }
+          if (std::isnan(q)) {
+            CHECK(h_row_set.empty());
+          }
+          quantiles.at(k) = q;
+        });
+      });
 
-  UpdateLeafValues(&quantiles, nidx, learning_rate, p_tree);
+  UpdateLeafValues(ctx, &quantiles, nidx, info, learning_rate, p_tree);
 }
 
 #if !defined(XGBOOST_USE_CUDA)

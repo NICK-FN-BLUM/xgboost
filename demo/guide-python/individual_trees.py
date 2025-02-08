@@ -2,6 +2,7 @@
 Demo for prediction using individual trees and model slices
 ===========================================================
 """
+
 import os
 
 import numpy as np
@@ -58,7 +59,7 @@ def individual_tree() -> None:
 
 
 def model_slices() -> None:
-    """Inference with each individual using model slices."""
+    """Inference with each individual tree using model slices."""
     X_train, y_train = load_svmlight_file(train)
     X_test, y_test = load_svmlight_file(test)
     Xy_train = xgb.QuantileDMatrix(X_train, y_train)

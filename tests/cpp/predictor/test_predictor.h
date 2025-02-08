@@ -31,21 +31,30 @@ inline gbm::GBTreeModel CreateTestModel(LearnerModelParam const* param, Context 
   return model;
 }
 
+inline auto CreatePredictorForTest(Context const* ctx) {
+  if (ctx->IsCPU()) {
+    return Predictor::Create("cpu_predictor", ctx);
+  } else if (ctx->IsSycl()) {
+    return Predictor::Create("sycl_predictor", ctx);
+  } else {
+    return Predictor::Create("gpu_predictor", ctx);
+  }
+}
+
+// fixme: cpu test
 template <typename Page>
-void TestPredictionFromGradientIndex(std::string name, size_t rows, size_t cols,
+void TestPredictionFromGradientIndex(Context const* ctx, size_t rows, size_t cols,
                                      std::shared_ptr<DMatrix> p_hist) {
   constexpr size_t kClasses { 3 };
 
   LearnerModelParam mparam{MakeMP(cols, .5, kClasses)};
-  auto lparam = CreateEmptyGenericParam(0);
+  auto cuda_ctx = MakeCUDACtx(0);
 
   std::unique_ptr<Predictor> predictor =
-      std::unique_ptr<Predictor>(Predictor::Create(name, &lparam));
+      std::unique_ptr<Predictor>(CreatePredictorForTest(&cuda_ctx));
   predictor->Configure({});
 
-  Context ctx;
-  ctx.UpdateAllowUnknown(Args{});
-  gbm::GBTreeModel model = CreateTestModel(&mparam, &ctx, kClasses);
+  gbm::GBTreeModel model = CreateTestModel(&mparam, ctx, kClasses);
 
   {
     auto p_precise = RandomDataGenerator(rows, cols, 0).GenerateDMatrix();
@@ -76,25 +85,39 @@ void TestPredictionFromGradientIndex(std::string name, size_t rows, size_t cols,
   }
 }
 
+void TestBasic(DMatrix* dmat, Context const * ctx);
+
 // p_full and p_hist should come from the same data set.
-void TestTrainingPrediction(size_t rows, size_t bins, std::string tree_method,
-                            std::shared_ptr<DMatrix> p_full,
-                            std::shared_ptr<DMatrix> p_hist);
+void TestTrainingPrediction(Context const* ctx, size_t rows, size_t bins,
+                            std::shared_ptr<DMatrix> p_full, std::shared_ptr<DMatrix> p_hist);
 
-void TestInplacePrediction(std::shared_ptr<DMatrix> x, std::string predictor, bst_row_t rows,
-                           bst_feature_t cols, int32_t device = -1);
+void TestInplacePrediction(Context const* ctx, std::shared_ptr<DMatrix> x, bst_idx_t rows,
+                           bst_feature_t cols);
 
-void TestPredictionWithLesserFeatures(std::string preditor_name);
+void TestPredictionWithLesserFeatures(Context const* ctx);
 
-void TestCategoricalPrediction(std::string name);
+void TestPredictionDeviceAccess();
 
-void TestCategoricalPredictLeaf(StringView name);
+void TestCategoricalPrediction(bool use_gpu, bool is_column_split);
 
-void TestIterationRange(std::string name);
+void TestPredictionWithLesserFeaturesColumnSplit(bool use_gpu);
 
-void TestSparsePrediction(float sparsity, std::string predictor);
+void TestCategoricalPredictLeaf(Context const *ctx, bool is_column_split);
+
+void TestIterationRange(Context const* ctx);
+
+void TestIterationRangeColumnSplit(int world_size, bool use_gpu);
+
+void TestSparsePrediction(Context const* ctx, float sparsity);
+
+void TestSparsePredictionColumnSplit(int world_size, bool use_gpu, float sparsity);
 
 void TestVectorLeafPrediction(Context const* ctx);
+
+class ShapExternalMemoryTest : public ::testing::TestWithParam<std::tuple<bool, bool>> {
+ public:
+  void Run(Context const* ctx, bool is_qdm, bool is_interaction);
+};
 }  // namespace xgboost
 
 #endif  // XGBOOST_TEST_PREDICTOR_H_

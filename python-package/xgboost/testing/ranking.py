@@ -75,3 +75,46 @@ def run_ranking_qid_df(impl: ModuleType, tree_method: str) -> None:
 
     with pytest.raises(ValueError, match="Either `group` or `qid`."):
         ranker.fit(df, y, eval_set=[(X, y)])
+
+
+def run_ranking_categorical(device: str) -> None:
+    """Test LTR with categorical features."""
+    from sklearn.model_selection import cross_val_score
+
+    X, y = tm.make_categorical(
+        n_samples=512, n_features=10, n_categories=3, onehot=False
+    )
+    rng = np.random.default_rng(1994)
+    qid = rng.choice(3, size=y.shape[0])
+    qid = np.sort(qid)
+    X["qid"] = qid
+
+    ltr = xgb.XGBRanker(enable_categorical=True, device=device)
+    ltr.fit(X, y)
+    score = ltr.score(X, y)
+    assert score > 0.9
+
+    ltr = xgb.XGBRanker(enable_categorical=True, device=device)
+
+    # test using the score function inside sklearn.
+    scores = cross_val_score(ltr, X, y)
+    for s in scores:
+        assert s > 0.7
+
+
+def run_normalization(device: str) -> None:
+    """Test normalization."""
+    X, y, qid, _ = tm.make_ltr(2048, 4, 64, 3)
+    ltr = xgb.XGBRanker(objective="rank:pairwise", n_estimators=4, device=device)
+    ltr.fit(X, y, qid=qid, eval_set=[(X, y)], eval_qid=[qid])
+    e0 = ltr.evals_result()
+
+    ltr = xgb.XGBRanker(
+        objective="rank:pairwise",
+        n_estimators=4,
+        device=device,
+        lambdarank_normalization=False,
+    )
+    ltr.fit(X, y, qid=qid, eval_set=[(X, y)], eval_qid=[qid])
+    e1 = ltr.evals_result()
+    assert e1["validation_0"]["ndcg@32"][-1] > e0["validation_0"]["ndcg@32"][-1]

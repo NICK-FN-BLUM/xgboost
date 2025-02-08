@@ -20,8 +20,8 @@ void FitIntercept::InitEstimation(MetaInfo const& info, linalg::Vector<float>* b
     CheckInitInputs(info);
   }
   // Avoid altering any state in child objective.
-  HostDeviceVector<float> dummy_predt(info.labels.Size(), 0.0f, this->ctx_->gpu_id);
-  HostDeviceVector<GradientPair> gpair(info.labels.Size(), GradientPair{}, this->ctx_->gpu_id);
+  HostDeviceVector<float> dummy_predt(info.labels.Size(), 0.0f, this->ctx_->Device());
+  linalg::Matrix<GradientPair> gpair(info.labels.Shape(), this->ctx_->Device());
 
   Json config{Object{}};
   this->SaveConfig(&config);
@@ -34,9 +34,24 @@ void FitIntercept::InitEstimation(MetaInfo const& info, linalg::Vector<float>* b
   bst_target_t n_targets = this->Targets(info);
   linalg::Vector<float> leaf_weight;
   tree::FitStump(this->ctx_, info, gpair, n_targets, &leaf_weight);
-  // workaround, we don't support multi-target due to binary model serialization for
+  // Workaround, we don't support multi-target due to binary model serialization for
   // base margin.
   common::Mean(this->ctx_, leaf_weight, base_score);
   this->PredTransform(base_score->Data());
+}
+
+void FitInterceptGlmLike::InitEstimation(MetaInfo const& info,
+                                         linalg::Vector<float>* base_score) const {
+  if (this->Task().task == ObjInfo::kRegression) {
+    CheckInitInputs(info);
+  }
+  linalg::Vector<float> out;
+  if (info.weights_.Empty()) {
+    common::SampleMean(this->ctx_, info.IsColumnSplit(), info.labels, &out);
+  } else {
+    common::WeightedSampleMean(this->ctx_, info.IsColumnSplit(), info.labels, info.weights_, &out);
+  }
+  common::Mean(this->ctx_, out, base_score);
+  CHECK_EQ(base_score->Size(), 1);
 }
 }  // namespace xgboost::obj

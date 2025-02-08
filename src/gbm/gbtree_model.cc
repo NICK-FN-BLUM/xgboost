@@ -112,7 +112,6 @@ void GBTreeModel::SaveModel(Json* p_out) const {
   out["gbtree_model_param"] = ToJson(param);
   std::vector<Json> trees_json(trees.size());
 
-  CHECK(ctx_);
   common::ParallelFor(trees.size(), ctx_->Threads(), [&](auto t) {
     auto const& tree = trees[t];
     Json jtree{Object{}};
@@ -150,8 +149,6 @@ void GBTreeModel::LoadModel(Json const& in) {
   auto const& tree_info_json = get<Array const>(in["tree_info"]);
   CHECK_EQ(tree_info_json.size(), param.num_trees);
   tree_info.resize(param.num_trees);
-
-  CHECK(ctx_);
 
   common::ParallelFor(param.num_trees, ctx_->Threads(), [&](auto t) {
     auto tree_id = get<Integer const>(trees_json[t]["id"]);

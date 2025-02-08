@@ -17,15 +17,15 @@ TEST(Linear, Shotgun) {
 
   auto p_fmat = xgboost::RandomDataGenerator(kRows, kCols, 0).GenerateDMatrix();
 
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   LearnerModelParam mparam{MakeMP(kCols, .5, 1)};
 
   {
     auto updater =
         std::unique_ptr<xgboost::LinearUpdater>(xgboost::LinearUpdater::Create("shotgun", &ctx));
     updater->Configure({{"eta", "1."}});
-    xgboost::HostDeviceVector<xgboost::GradientPair> gpair(
-        p_fmat->Info().num_row_, xgboost::GradientPair(-5, 1.0));
+    linalg::Matrix<xgboost::GradientPair> gpair{
+        linalg::Constant(&ctx, xgboost::GradientPair(-5, 1.0), p_fmat->Info().num_row_, 1)};
     xgboost::gbm::GBLinearModel model{&mparam};
     model.LazyInitModel();
     updater->Update(&gpair, p_fmat.get(), &model, gpair.Size());
@@ -49,14 +49,14 @@ TEST(Linear, coordinate) {
 
   auto p_fmat = xgboost::RandomDataGenerator(kRows, kCols, 0).GenerateDMatrix();
 
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   LearnerModelParam mparam{MakeMP(kCols, .5, 1)};
 
   auto updater = std::unique_ptr<xgboost::LinearUpdater>(
       xgboost::LinearUpdater::Create("coord_descent", &ctx));
   updater->Configure({{"eta", "1."}});
-  xgboost::HostDeviceVector<xgboost::GradientPair> gpair(
-      p_fmat->Info().num_row_, xgboost::GradientPair(-5, 1.0));
+  linalg::Matrix<xgboost::GradientPair> gpair{
+      linalg::Constant(&ctx, xgboost::GradientPair(-5, 1.0), p_fmat->Info().num_row_, 1)};
   xgboost::gbm::GBLinearModel model{&mparam};
   model.LazyInitModel();
   updater->Update(&gpair, p_fmat.get(), &model, gpair.Size());

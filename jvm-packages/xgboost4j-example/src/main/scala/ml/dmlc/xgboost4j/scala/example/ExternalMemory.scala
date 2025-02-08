@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2024 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -18,15 +18,15 @@ package ml.dmlc.xgboost4j.scala.example
 
 import scala.collection.mutable
 
-import ml.dmlc.xgboost4j.scala.{XGBoost, DMatrix}
+import ml.dmlc.xgboost4j.scala.{DMatrix, XGBoost}
 
 object ExternalMemory {
   def main(args: Array[String]): Unit = {
     // this is the only difference, add a # followed by a cache prefix name
     // several cache file with the prefix will be generated
     // currently only support convert from libsvm file
-    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train#dtrain.cache")
-    val testMat = new DMatrix("../../demo/data/agaricus.txt.test#dtest.cache")
+    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train?format=libsvm#dtrain.cache")
+    val testMat = new DMatrix("../../demo/data/agaricus.txt.test?format=libsvm#dtest.cache")
 
     val params = new mutable.HashMap[String, Any]()
     params += "eta" -> 1.0
@@ -54,6 +54,6 @@ object ExternalMemory {
     testMat.setBaseMargin(testPred)
 
     System.out.println("result of running from initial prediction")
-    val booster2 = XGBoost.train(trainMat, params.toMap, 1, watches.toMap)
+    XGBoost.train(trainMat, params.toMap, 1, watches.toMap)
   }
 }

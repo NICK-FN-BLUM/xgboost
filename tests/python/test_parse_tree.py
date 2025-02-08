@@ -13,7 +13,7 @@ rng = np.random.RandomState(1994)
 
 class TestTreesToDataFrame:
     def build_model(self, max_depth, num_round):
-        dtrain = xgb.DMatrix(dpath + 'agaricus.txt.train')
+        dtrain, _ = tm.load_agaricus(__file__)
         param = {'max_depth': max_depth, 'objective': 'binary:logistic',
                  'verbosity': 1}
         num_round = num_round
@@ -49,7 +49,7 @@ class TestTreesToDataFrame:
         assert np.allclose(cover_from_dump, cover_from_df)
 
     def run_tree_to_df_categorical(self, tree_method: str) -> None:
-        X, y = tm.make_categorical(100, 10, 31, False)
+        X, y = tm.make_categorical(100, 10, 31, onehot=False)
         Xy = xgb.DMatrix(X, y, enable_categorical=True)
         booster = xgb.train({"tree_method": tree_method}, Xy, num_boost_round=10)
         df = booster.trees_to_dataframe()
@@ -61,7 +61,7 @@ class TestTreesToDataFrame:
         self.run_tree_to_df_categorical("approx")
 
     def run_split_value_histograms(self, tree_method) -> None:
-        X, y = tm.make_categorical(1000, 10, 13, False)
+        X, y = tm.make_categorical(1000, 10, 13, onehot=False)
         reg = xgb.XGBRegressor(tree_method=tree_method, enable_categorical=True)
         reg.fit(X, y)
 

@@ -1,4 +1,5 @@
 """Testing code shared by other tests."""
+
 # pylint: disable=invalid-name
 import collections
 import importlib.util
@@ -51,6 +52,7 @@ def validate_data_initialization(
 
 # pylint: disable=too-many-arguments,too-many-locals
 def get_feature_weights(
+    *,
     X: ArrayLike,
     y: ArrayLike,
     fw: np.ndarray,

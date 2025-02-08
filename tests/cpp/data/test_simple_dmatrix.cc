@@ -1,5 +1,5 @@
 /**
- * Copyright 2016-2023 by XGBoost Contributors
+ * Copyright 2016-2024, XGBoost Contributors
  */
 #include <xgboost/data.h>
 
@@ -9,6 +9,7 @@
 
 #include "../../../src/data/adapter.h"         // ArrayAdapter
 #include "../../../src/data/simple_dmatrix.h"  // SimpleDMatrix
+#include "../collective/test_worker.h"         // for TestDistributedGlobal
 #include "../filesystem.h"                     // dmlc::TemporaryDirectory
 #include "../helpers.h"                        // RandomDataGenerator,CreateSimpleTestData
 #include "xgboost/base.h"
@@ -17,11 +18,15 @@
 
 using namespace xgboost;  // NOLINT
 
+namespace {
+std::string UriSVM(std::string name) { return name + "?format=libsvm"; }
+}  // namespace
+
 TEST(SimpleDMatrix, MetaInfo) {
   dmlc::TemporaryDirectory tempdir;
   const std::string tmp_file = tempdir.path + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(tmp_file);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file));
 
   // Test the metadata that was parsed
   EXPECT_EQ(dmat->Info().num_row_, 2);
@@ -37,7 +42,7 @@ TEST(SimpleDMatrix, RowAccess) {
   dmlc::TemporaryDirectory tempdir;
   const std::string tmp_file = tempdir.path + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(tmp_file, false);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file), false);
 
   // Loop over the batches and count the records
   int64_t row_count = 0;
@@ -57,16 +62,17 @@ TEST(SimpleDMatrix, RowAccess) {
 }
 
 TEST(SimpleDMatrix, ColAccessWithoutBatches) {
+  Context ctx;
   dmlc::TemporaryDirectory tempdir;
   const std::string tmp_file = tempdir.path + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(tmp_file);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file));
 
   ASSERT_TRUE(dmat->SingleColBlock());
 
   // Loop over the batches and assert the data is as expected
   int64_t num_col_batch = 0;
-  for (const auto &batch : dmat->GetBatches<xgboost::SortedCSCPage>()) {
+  for (const auto &batch : dmat->GetBatches<xgboost::SortedCSCPage>(&ctx)) {
     num_col_batch += 1;
     EXPECT_EQ(batch.Size(), dmat->Info().num_col_)
         << "Expected batch size = number of cells as #batches is 1.";
@@ -218,7 +224,7 @@ TEST(SimpleDMatrix, FromFile) {
     auto batch = page.GetView();
     EXPECT_EQ(batch.Size(), kExpectedNumRow);
     EXPECT_EQ(page.offset.HostVector(),
-              std::vector<bst_row_t>({0, 3, 6, 9, 12, 15, 15}));
+              std::vector<bst_idx_t>({0, 3, 6, 9, 12, 15, 15}));
     EXPECT_EQ(page.base_rowid, 0);
 
     for (auto i = 0ull; i < batch.Size() - 1; i++) {
@@ -263,7 +269,7 @@ TEST(SimpleDMatrix, Slice) {
   std::iota(upper.begin(), upper.end(), 1.0f);
 
   auto& margin = p_m->Info().base_margin_;
-  margin = decltype(p_m->Info().base_margin_){{kRows, kClasses}, Context::kCpuId};
+  margin = decltype(p_m->Info().base_margin_){{kRows, kClasses}, DeviceOrd::CPU()};
 
   std::array<int32_t, 3> ridxs {1, 3, 5};
   std::unique_ptr<DMatrix> out { p_m->Slice(ridxs) };
@@ -293,8 +299,8 @@ TEST(SimpleDMatrix, Slice) {
         ASSERT_EQ(p_m->Info().weights_.HostVector().at(ridx),
                   out->Info().weights_.HostVector().at(i));
 
-        auto out_margin = out->Info().base_margin_.View(Context::kCpuId);
-        auto in_margin = margin.View(Context::kCpuId);
+        auto out_margin = out->Info().base_margin_.View(DeviceOrd::CPU());
+        auto in_margin = margin.View(DeviceOrd::CPU());
         for (size_t j = 0; j < kClasses; ++j) {
           ASSERT_EQ(out_margin(i, j), in_margin(ridx, j));
         }
@@ -336,7 +342,7 @@ TEST(SimpleDMatrix, SliceCol) {
   std::iota(upper.begin(), upper.end(), 1.0f);
 
   auto& margin = p_m->Info().base_margin_;
-  margin = decltype(p_m->Info().base_margin_){{kRows, kClasses}, Context::kCpuId};
+  margin = decltype(p_m->Info().base_margin_){{kRows, kClasses}, DeviceOrd::CPU()};
 
   auto constexpr kSlices {2};
   auto constexpr kSliceSize {4};
@@ -367,8 +373,8 @@ TEST(SimpleDMatrix, SliceCol) {
                     out->Info().labels_upper_bound_.HostVector().at(i));
           ASSERT_EQ(p_m->Info().weights_.HostVector().at(i), out->Info().weights_.HostVector().at(i));
 
-          auto out_margin = out->Info().base_margin_.View(Context::kCpuId);
-          auto in_margin = margin.View(Context::kCpuId);
+          auto out_margin = out->Info().base_margin_.View(DeviceOrd::CPU());
+          auto in_margin = margin.View(DeviceOrd::CPU());
           for (size_t j = 0; j < kClasses; ++j) {
             ASSERT_EQ(out_margin(i, j), in_margin(i, j));
           }
@@ -387,7 +393,7 @@ TEST(SimpleDMatrix, SaveLoadBinary) {
   dmlc::TemporaryDirectory tempdir;
   const std::string tmp_file = tempdir.path + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix * dmat = xgboost::DMatrix::Load(tmp_file);
+  xgboost::DMatrix * dmat = xgboost::DMatrix::Load(UriSVM(tmp_file));
   data::SimpleDMatrix *simple_dmat = dynamic_cast<data::SimpleDMatrix*>(dmat);
 
   const std::string tmp_binfile = tempdir.path + "/csr_source.binary";
@@ -422,4 +428,21 @@ TEST(SimpleDMatrix, Threads) {
   std::unique_ptr<DMatrix> p_fmat{
       DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), 0, "")};
   ASSERT_EQ(p_fmat->Ctx()->Threads(), AllThreadsForTest());
+}
+
+namespace {
+void VerifyColumnSplit() {
+  size_t constexpr kRows {16};
+  size_t constexpr kCols {8};
+  auto p_fmat = RandomDataGenerator{kRows, kCols, 0}.GenerateDMatrix(false, DataSplitMode::kCol);
+
+  ASSERT_EQ(p_fmat->Info().num_col_, kCols * collective::GetWorldSize());
+  ASSERT_EQ(p_fmat->Info().num_row_, kRows);
+  ASSERT_EQ(p_fmat->Info().data_split_mode, DataSplitMode::kCol);
+}
+}  // anonymous namespace
+
+TEST(SimpleDMatrix, ColumnSplit) {
+  auto constexpr kWorldSize{3};
+  collective::TestDistributedGlobal(kWorldSize, VerifyColumnSplit);
 }

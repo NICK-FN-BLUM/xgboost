@@ -14,15 +14,15 @@ TEST(ArrayInterface, Initialize) {
   HostDeviceVector<float> storage;
   auto array = RandomDataGenerator{kRows, kCols, 0}.GenerateArrayInterface(&storage);
   auto arr_interface = ArrayInterface<2>(StringView{array});
-  ASSERT_EQ(arr_interface.Shape(0), kRows);
-  ASSERT_EQ(arr_interface.Shape(1), kCols);
+  ASSERT_EQ(arr_interface.Shape<0>(), kRows);
+  ASSERT_EQ(arr_interface.Shape<1>(), kCols);
   ASSERT_EQ(arr_interface.data, storage.ConstHostPointer());
   ASSERT_EQ(arr_interface.ElementSize(), 4);
   ASSERT_EQ(arr_interface.type, ArrayInterfaceHandler::kF4);
 
   HostDeviceVector<size_t> u64_storage(storage.Size());
   std::string u64_arr_str{ArrayInterfaceStr(linalg::TensorView<size_t const, 2>{
-      u64_storage.ConstHostSpan(), {kRows, kCols}, Context::kCpuId})};
+      u64_storage.ConstHostSpan(), {kRows, kCols}, DeviceOrd::CPU()})};
   std::copy(storage.ConstHostVector().cbegin(), storage.ConstHostVector().cend(),
             u64_storage.HostSpan().begin());
   auto u64_arr = ArrayInterface<2>{u64_arr_str};
@@ -106,7 +106,7 @@ TEST(ArrayInterface, TrivialDim) {
   {
     ArrayInterface<1> arr_i{interface_str};
     ASSERT_EQ(arr_i.n, kRows);
-    ASSERT_EQ(arr_i.Shape(0), kRows);
+    ASSERT_EQ(arr_i.Shape<0>(), kRows);
   }
 
   std::swap(kRows, kCols);
@@ -114,7 +114,7 @@ TEST(ArrayInterface, TrivialDim) {
   {
     ArrayInterface<1> arr_i{interface_str};
     ASSERT_EQ(arr_i.n, kCols);
-    ASSERT_EQ(arr_i.Shape(0), kCols);
+    ASSERT_EQ(arr_i.Shape<0>(), kCols);
   }
 }
 

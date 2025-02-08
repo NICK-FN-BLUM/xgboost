@@ -1,15 +1,22 @@
 /**
- * Copyright 2021-2023 by XGBoost contributors.
+ * Copyright 2021-2024, XGBoost contributors.
  */
 #include <gtest/gtest.h>
+#include <xgboost/tree_updater.h>  // for TreeUpdater
 
-#include "../../../src/common/numeric.h"
+#include <algorithm>  // for transform
+#include <memory>     // for unique_ptr
+#include <vector>     // for vector
+
 #include "../../../src/tree/common_row_partitioner.h"
+#include "../../../src/tree/param.h"    // for TrainParam
+#include "../collective/test_worker.h"  // for TestDistributedGlobal
 #include "../helpers.h"
+#include "test_column_split.h"  // for TestColumnSplit
 #include "test_partitioner.h"
+#include "xgboost/tree_model.h"  // for RegTree
 
-namespace xgboost {
-namespace tree {
+namespace xgboost::tree {
 namespace {
 std::vector<float> GenerateHess(size_t n_samples) {
   auto grad = GenerateRandomGradients(n_samples);
@@ -34,7 +41,7 @@ TEST(Approx, Partitioner) {
   std::vector<CPUExpandEntry> candidates{{0, 0}};
   candidates.front().split.loss_chg = 0.4;
 
-  for (auto const& page : Xy->GetBatches<GHistIndexMatrix>({64, hess, true})) {
+  for (auto const& page : Xy->GetBatches<GHistIndexMatrix>(&ctx, {64, hess, true})) {
     bst_feature_t const split_ind = 0;
     {
       auto min_value = page.cut.MinValues()[split_ind];
@@ -54,22 +61,72 @@ TEST(Approx, Partitioner) {
       GetSplit(&tree, split_value, &candidates);
       partitioner.UpdatePosition(&ctx, page, candidates, &tree);
 
-      auto left_nidx = tree[RegTree::kRoot].LeftChild();
-      auto elem = partitioner[left_nidx];
-      ASSERT_LT(elem.Size(), n_samples);
-      ASSERT_GT(elem.Size(), 1);
-      for (auto it = elem.begin; it != elem.end; ++it) {
-        auto value = page.cut.Values().at(page.index[*it]);
-        ASSERT_LE(value, split_value);
+      {
+        auto left_nidx = tree[RegTree::kRoot].LeftChild();
+        auto const& elem = partitioner[left_nidx];
+        ASSERT_LT(elem.Size(), n_samples);
+        ASSERT_GT(elem.Size(), 1);
+        for (auto& it : elem) {
+          auto value = page.cut.Values().at(page.index[it]);
+          ASSERT_LE(value, split_value);
+        }
       }
-
-      auto right_nidx = tree[RegTree::kRoot].RightChild();
-      elem = partitioner[right_nidx];
-      for (auto it = elem.begin; it != elem.end; ++it) {
-        auto value = page.cut.Values().at(page.index[*it]);
-        ASSERT_GT(value, split_value) << *it;
+      {
+        auto right_nidx = tree[RegTree::kRoot].RightChild();
+        auto const& elem = partitioner[right_nidx];
+        for (auto& it : elem) {
+          auto value = page.cut.Values().at(page.index[it]);
+          ASSERT_GT(value, split_value) << it;
+        }
       }
     }
+  }
+}
+
+TEST(Approx, InteractionConstraint) {
+  auto constexpr kRows = 32;
+  auto constexpr kCols = 16;
+  auto p_dmat = GenerateCatDMatrix(kRows, kCols, 0.6f, false);
+  Context ctx;
+
+  linalg::Matrix<GradientPair> gpair({kRows}, ctx.Device());
+  gpair.Data()->Copy(GenerateRandomGradients(kRows));
+
+  ObjInfo task{ObjInfo::kRegression};
+  {
+    // With constraints
+    RegTree tree{1, kCols};
+
+    std::unique_ptr<TreeUpdater> updater{TreeUpdater::Create("grow_histmaker", &ctx, &task)};
+    TrainParam param;
+    param.UpdateAllowUnknown(
+        Args{{"interaction_constraints", "[[0, 1]]"}, {"num_feature", std::to_string(kCols)}});
+    std::vector<HostDeviceVector<bst_node_t>> position(1);
+    updater->Configure(Args{});
+    updater->Update(&param, &gpair, p_dmat.get(), position, {&tree});
+
+    ASSERT_EQ(tree.NumExtraNodes(), 4);
+    ASSERT_EQ(tree[0].SplitIndex(), 1);
+
+    ASSERT_EQ(tree[tree[0].LeftChild()].SplitIndex(), 0);
+    ASSERT_EQ(tree[tree[0].RightChild()].SplitIndex(), 0);
+  }
+  {
+    // Without constraints
+    RegTree tree{1u, kCols};
+
+    std::unique_ptr<TreeUpdater> updater{TreeUpdater::Create("grow_histmaker", &ctx, &task)};
+    std::vector<HostDeviceVector<bst_node_t>> position(1);
+    TrainParam param;
+    param.Init(Args{});
+    updater->Configure(Args{});
+    updater->Update(&param, &gpair, p_dmat.get(), position, {&tree});
+
+    ASSERT_EQ(tree.NumExtraNodes(), 10);
+    ASSERT_EQ(tree[0].SplitIndex(), 1);
+
+    ASSERT_NE(tree[tree[0].LeftChild()].SplitIndex(), 0);
+    ASSERT_NE(tree[tree[0].RightChild()].SplitIndex(), 0);
   }
 }
 
@@ -84,7 +141,7 @@ void TestColumnSplitPartitioner(size_t n_samples, size_t base_rowid, std::shared
 
   Context ctx;
   ctx.InitAllowUnknown(Args{});
-  for (auto const& page : dmat->GetBatches<GHistIndexMatrix>({64, *hess, true})) {
+  for (auto const& page : dmat->GetBatches<GHistIndexMatrix>(&ctx, {64, *hess, true})) {
     {
       RegTree tree;
       CommonRowPartitioner partitioner{&ctx, n_samples, base_rowid, true};
@@ -99,30 +156,32 @@ void TestColumnSplitPartitioner(size_t n_samples, size_t base_rowid, std::shared
       RegTree tree;
       GetSplit(&tree, mid_value, &candidates);
       partitioner.UpdatePosition(&ctx, page, candidates, &tree);
-
-      auto left_nidx = tree[RegTree::kRoot].LeftChild();
-      auto elem = partitioner[left_nidx];
-      ASSERT_LT(elem.Size(), n_samples);
-      ASSERT_GT(elem.Size(), 1);
-      auto expected_elem = expected_mid_partitioner[left_nidx];
-      ASSERT_EQ(elem.Size(), expected_elem.Size());
-      for (auto it = elem.begin, eit = expected_elem.begin; it != elem.end; ++it, ++eit) {
-        ASSERT_EQ(*it, *eit);
+      {
+        auto left_nidx = tree[RegTree::kRoot].LeftChild();
+        auto const& elem = partitioner[left_nidx];
+        ASSERT_LT(elem.Size(), n_samples);
+        ASSERT_GT(elem.Size(), 1);
+        auto const& expected_elem = expected_mid_partitioner[left_nidx];
+        ASSERT_EQ(elem.Size(), expected_elem.Size());
+        for (auto it = elem.begin(), eit = expected_elem.begin(); it != elem.end(); ++it, ++eit) {
+          ASSERT_EQ(*it, *eit);
+        }
       }
-
-      auto right_nidx = tree[RegTree::kRoot].RightChild();
-      elem = partitioner[right_nidx];
-      expected_elem = expected_mid_partitioner[right_nidx];
-      ASSERT_EQ(elem.Size(), expected_elem.Size());
-      for (auto it = elem.begin, eit = expected_elem.begin; it != elem.end; ++it, ++eit) {
-        ASSERT_EQ(*it, *eit);
+      {
+        auto right_nidx = tree[RegTree::kRoot].RightChild();
+        auto const& elem = partitioner[right_nidx];
+        auto const& expected_elem = expected_mid_partitioner[right_nidx];
+        ASSERT_EQ(elem.Size(), expected_elem.Size());
+        for (auto it = elem.begin(), eit = expected_elem.begin(); it != elem.end(); ++it, ++eit) {
+          ASSERT_EQ(*it, *eit);
+        }
       }
     }
   }
 }
 }  // anonymous namespace
 
-TEST(Approx, PartitionerColSplit) {
+TEST(Approx, PartitionerColumnSplit) {
   size_t n_samples = 1024, n_features = 16, base_rowid = 0;
   auto const Xy = RandomDataGenerator{n_samples, n_features, 0}.GenerateDMatrix(true);
   auto hess = GenerateHess(n_samples);
@@ -133,7 +192,7 @@ TEST(Approx, PartitionerColSplit) {
   Context ctx;
   ctx.InitAllowUnknown(Args{});
   CommonRowPartitioner mid_partitioner{&ctx, n_samples, base_rowid, false};
-  for (auto const& page : Xy->GetBatches<GHistIndexMatrix>({64, hess, true})) {
+  for (auto const& page : Xy->GetBatches<GHistIndexMatrix>(&ctx, {64, hess, true})) {
     bst_feature_t const split_ind = 0;
     min_value = page.cut.MinValues()[split_ind];
 
@@ -145,8 +204,31 @@ TEST(Approx, PartitionerColSplit) {
   }
 
   auto constexpr kWorkers = 4;
-  RunWithInMemoryCommunicator(kWorkers, TestColumnSplitPartitioner, n_samples, base_rowid, Xy,
-                              &hess, min_value, mid_value, mid_partitioner);
+  collective::TestDistributedGlobal(kWorkers, [&] {
+    TestColumnSplitPartitioner(n_samples, base_rowid, Xy, &hess, min_value, mid_value,
+                               mid_partitioner);
+  });
 }
-}  // namespace tree
-}  // namespace xgboost
+
+namespace {
+class TestApproxColumnSplit : public ::testing::TestWithParam<std::tuple<bool, float>> {
+ public:
+  void Run() {
+    auto [categorical, sparsity] = GetParam();
+    TestColumnSplit(1u, categorical, "grow_histmaker", sparsity);
+  }
+};
+}  // namespace
+
+TEST_P(TestApproxColumnSplit, Basic) { this->Run(); }
+
+INSTANTIATE_TEST_SUITE_P(ColumnSplit, TestApproxColumnSplit, ::testing::ValuesIn([]() {
+                           std::vector<std::tuple<bool, float>> params;
+                           for (auto categorical : {true, false}) {
+                             for (auto sparsity : {0.0f, 0.6f}) {
+                               params.emplace_back(categorical, sparsity);
+                             }
+                           }
+                           return params;
+                         }()));
+}  // namespace xgboost::tree

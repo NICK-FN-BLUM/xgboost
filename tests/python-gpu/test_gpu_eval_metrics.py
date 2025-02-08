@@ -1,10 +1,11 @@
+import json
 import sys
 
 import pytest
 
 import xgboost
 from xgboost import testing as tm
-from xgboost.testing.metrics import check_quantile_error
+from xgboost.testing.metrics import check_precision_score, check_quantile_error
 
 sys.path.append("tests/python")
 import test_eval_metrics as test_em  # noqa
@@ -36,19 +37,22 @@ class TestGPUEvalMetrics:
 
         Xy = xgboost.DMatrix(X, y, group=group)
 
-        cpu = xgboost.train(
+        booster = xgboost.train(
             {"tree_method": "hist", "eval_metric": "auc", "objective": "rank:ndcg"},
             Xy,
             num_boost_round=10,
         )
-        cpu_auc = float(cpu.eval(Xy).split(":")[1])
-
-        gpu = xgboost.train(
-            {"tree_method": "gpu_hist", "eval_metric": "auc", "objective": "rank:ndcg"},
-            Xy,
-            num_boost_round=10,
+        cpu_auc = float(booster.eval(Xy).split(":")[1])
+        booster.set_param({"device": "cuda:0"})
+        assert (
+            json.loads(booster.save_config())["learner"]["generic_param"]["device"]
+            == "cuda:0"
         )
-        gpu_auc = float(gpu.eval(Xy).split(":")[1])
+        gpu_auc = float(booster.eval(Xy).split(":")[1])
+        assert (
+            json.loads(booster.save_config())["learner"]["generic_param"]["device"]
+            == "cuda:0"
+        )
 
         np.testing.assert_allclose(cpu_auc, gpu_auc)
 
@@ -60,6 +64,9 @@ class TestGPUEvalMetrics:
 
     def test_pr_auc_ltr(self):
         self.cpu_test.run_pr_auc_ltr("gpu_hist")
+
+    def test_precision_score(self):
+        check_precision_score("gpu_hist")
 
     @pytest.mark.skipif(**tm.no_sklearn())
     def test_quantile_error(self) -> None:

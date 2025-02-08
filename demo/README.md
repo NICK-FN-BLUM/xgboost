@@ -24,36 +24,31 @@ Code Examples
 -------------
 ### Features Walkthrough
 
+_Note: for the R package, see the in-package examples and vignettes instead_
+
 This is a list of short codes introducing different functionalities of xgboost packages.
 
 * Basic walkthrough of packages
   [python](guide-python/basic_walkthrough.py)
-  [R](../R-package/demo/basic_walkthrough.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/basic_walkthrough.jl)
   [PHP](https://github.com/bpachev/xgboost-php/blob/master/demo/titanic_demo.php)
 * Customize loss function, and evaluation metric
   [python](guide-python/custom_objective.py)
-  [R](../R-package/demo/custom_objective.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/custom_objective.jl)
 * Boosting from existing prediction
   [python](guide-python/boost_from_prediction.py)
-  [R](../R-package/demo/boost_from_prediction.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/boost_from_prediction.jl)
 * Predicting using first n trees
   [python](guide-python/predict_first_ntree.py)
-  [R](../R-package/demo/predict_first_ntree.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/predict_first_ntree.jl)
 * Generalized Linear Model
   [python](guide-python/generalized_linear_model.py)
-  [R](../R-package/demo/generalized_linear_model.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/generalized_linear_model.jl)
 * Cross validation
   [python](guide-python/cross_validation.py)
-  [R](../R-package/demo/cross_validation.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/cross_validation.jl)
 * Predicting leaf indices
   [python](guide-python/predict_leaf_indices.py)
-  [R](../R-package/demo/predict_leaf_indices.R)
 
 ### Basic Examples by Tasks
 
@@ -106,7 +101,7 @@ Please send pull requests if you find ones that are missing here.
 - Prarthana Bhat, 2nd place winner in [DYD Competition](https://datahack.analyticsvidhya.com/contest/date-your-data/). Link to [Solution](https://github.com/analyticsvidhya/DateYourData/blob/master/Prathna_Bhat_Model.R).
 
 ## Talks
-- [XGBoost: A Scalable Tree Boosting System](http://datascience.la/xgboost-workshop-and-meetup-talk-with-tianqi-chen/) (video+slides) by Tianqi Chen at the Los Angeles Data Science meetup
+- XGBoost: A Scalable Tree Boosting System ([video] (https://www.youtube.com/watch?v=Vly8xGnNiWs) + [slides](https://speakerdeck.com/datasciencela/tianqi-chen-xgboost-overview-and-latest-news-la-meetup-talk)) by Tianqi Chen at the Los Angeles Data Science meetup
 
 ## Tutorials
 
@@ -145,7 +140,7 @@ Send a PR to add a one sentence description:)
 ## Tools using XGBoost
 
 - [BayesBoost](https://github.com/mpearmain/BayesBoost) - Bayesian Optimization using xgboost and sklearn API
-- [FLAML](https://github.com/microsoft/FLAML) - An open source AutoML library 
+- [FLAML](https://github.com/microsoft/FLAML) - An open source AutoML library
 designed to automatically produce accurate machine learning models with low computational cost. FLAML includes [XGBoost as one of the default learners](https://github.com/microsoft/FLAML/blob/main/flaml/model.py) and can also be used as a fast hyperparameter tuning tool for XGBoost ([code example](https://microsoft.github.io/FLAML/docs/Examples/AutoML-for-XGBoost)).
 - [gp_xgboost_gridsearch](https://github.com/vatsan/gp_xgboost_gridsearch) - In-database parallel grid-search for XGBoost on [Greenplum](https://github.com/greenplum-db/gpdb) using PL/Python
 - [tpot](https://github.com/rhiever/tpot) - A Python tool that automatically creates and optimizes machine learning pipelines using genetic programming.

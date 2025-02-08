@@ -2,10 +2,18 @@
 Quantile Regression
 ===================
 
+    .. versionadded:: 2.0.0
+
 The script is inspired by this awesome example in sklearn:
 https://scikit-learn.org/stable/auto_examples/ensemble/plot_gradient_boosting_quantile.html
 
+.. note::
+
+    The feature is only supported using the Python, R, and C packages. In addition, quantile
+    crossing can happen due to limitation in the algorithm.
+
 """
+
 import argparse
 from typing import Dict
 
@@ -39,10 +47,11 @@ def quantile_loss(args: argparse.Namespace) -> None:
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=rng)
     # We will be using the `hist` tree method, quantile DMatrix can be used to preserve
-    # memory.
+    # memory (which has nothing to do with quantile regression itself, see its document
+    # for details).
     # Do not use the `exact` tree method for quantile regression, otherwise the
     # performance might drop.
-    Xy = xgb.QuantileDMatrix(X, y)
+    Xy = xgb.QuantileDMatrix(X_train, y_train)
     # use Xy as a reference
     Xy_test = xgb.QuantileDMatrix(X_test, y_test, ref=Xy)
 

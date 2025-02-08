@@ -1,5 +1,5 @@
 /**
- * Copyright 2017-2023 by Contributors
+ * Copyright 2017-2024 by Contributors
  */
 #include "xgboost/predictor.h"
 
@@ -9,7 +9,7 @@
 #include <string>                        // for string, to_string
 
 #include "../gbm/gbtree_model.h"         // for GBTreeModel
-#include "xgboost/base.h"                // for bst_float, Args, bst_group_t, bst_row_t
+#include "xgboost/base.h"                // for bst_float, Args, bst_group_t, bst_idx_t
 #include "xgboost/context.h"             // for Context
 #include "xgboost/data.h"                // for MetaInfo
 #include "xgboost/host_device_vector.h"  // for HostDeviceVector
@@ -34,7 +34,7 @@ Predictor* Predictor::Create(std::string const& name, Context const* ctx) {
 }
 
 template <int32_t D>
-void ValidateBaseMarginShape(linalg::Tensor<float, D> const& margin, bst_row_t n_samples,
+void ValidateBaseMarginShape(linalg::Tensor<float, D> const& margin, bst_idx_t n_samples,
                              bst_group_t n_groups) {
   // FIXME: Bindings other than Python doesn't have shape.
   std::string expected{"Invalid shape of base_margin. Expected: (" + std::to_string(n_samples) +
@@ -46,11 +46,11 @@ void ValidateBaseMarginShape(linalg::Tensor<float, D> const& margin, bst_row_t n
 void Predictor::InitOutPredictions(const MetaInfo& info, HostDeviceVector<bst_float>* out_preds,
                                    const gbm::GBTreeModel& model) const {
   CHECK_NE(model.learner_model_param->num_output_group, 0);
-  std::size_t n{model.learner_model_param->OutputLength() * info.num_row_};
+  auto n = static_cast<size_t>(model.learner_model_param->OutputLength() * info.num_row_);
 
   const HostDeviceVector<bst_float>* base_margin = info.base_margin_.Data();
-  if (ctx_->gpu_id >= 0) {
-    out_preds->SetDevice(ctx_->gpu_id);
+  if (ctx_->Device().IsCUDA()) {
+    out_preds->SetDevice(ctx_->Device());
   }
   if (!base_margin->Empty()) {
     out_preds->Resize(n);
@@ -60,7 +60,7 @@ void Predictor::InitOutPredictions(const MetaInfo& info, HostDeviceVector<bst_fl
   } else {
     // cannot rely on the Resize to fill as it might skip if the size is already correct.
     out_preds->Resize(n);
-    auto base_score = model.learner_model_param->BaseScore(Context::kCpuId)(0);
+    auto base_score = model.learner_model_param->BaseScore(DeviceOrd::CPU())(0);
     out_preds->Fill(base_score);
   }
 }

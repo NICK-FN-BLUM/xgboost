@@ -54,7 +54,7 @@ class XGBoostJNI {
   public final static native int XGDMatrixCreateFromFile(String fname, int silent, long[] out);
 
   final static native int XGDMatrixCreateFromDataIter(java.util.Iterator<DataBatch> iter,
-                                                             String cache_info, long[] out);
+      String cache_info, float missing, long[] out);
 
   public final static native int XGDMatrixCreateFromCSR(long[] indptr, int[] indices,
                                                         float[] data, int shapeParam,
@@ -110,7 +110,7 @@ class XGBoostJNI {
 
   public final static native int XGBoosterUpdateOneIter(long handle, int iter, long dtrain);
 
-  public final static native int XGBoosterBoostOneIter(long handle, long dtrain, float[] grad,
+  public final static native int XGBoosterTrainOneIter(long handle, long dtrain, int iter, float[] grad,
                                                        float[] hess);
 
   public final static native int XGBoosterEvalOneIter(long handle, int iter, long[] dmats,
@@ -118,6 +118,10 @@ class XGBoostJNI {
 
   public final static native int XGBoosterPredict(long handle, long dmat, int option_mask,
                                                   int ntree_limit, float[][] predicts);
+
+  public final static native int XGBoosterPredictFromDense(long handle, float[] data,
+      long nrow, long ncol, float missing, int iteration_begin, int iteration_end, int predict_type, float[] margin,
+      float[][] predicts);
 
   public final static native int XGBoosterLoadModel(long handle, String fname);
 
@@ -136,16 +140,29 @@ class XGBoostJNI {
   public final static native int XGBoosterGetAttrNames(long handle, String[][] out_strings);
   public final static native int XGBoosterGetAttr(long handle, String key, String[] out_string);
   public final static native int XGBoosterSetAttr(long handle, String key, String value);
-  public final static native int XGBoosterLoadRabitCheckpoint(long handle, int[] out_version);
-  public final static native int XGBoosterSaveRabitCheckpoint(long handle);
+
   public final static native int XGBoosterGetNumFeature(long handle, long[] feature);
 
+  public final static native int XGBoosterGetNumBoostedRound(long handle, int[] rounds);
+
   // communicator functions
-  public final static native int CommunicatorInit(String[] args);
+  public final static native int CommunicatorInit(String args);
   public final static native int CommunicatorFinalize();
   public final static native int CommunicatorPrint(String msg);
   public final static native int CommunicatorGetRank(int[] out);
   public final static native int CommunicatorGetWorldSize(int[] out);
+
+  // Tracker functions
+  public final static native int TrackerCreate(String host, int nWorkers, int port, int sortby, long timeout,
+      long[] out);
+
+  public final static native int TrackerRun(long handle);
+
+  public final static native int TrackerWaitFor(long handle, long timeout);
+
+  public final static native int TrackerWorkerArgs(long handle, long timeout, String[] out);
+
+  public final static native int TrackerFree(long handle);
 
   // Perform Allreduce operation on data in sendrecvbuf.
   final static native int CommunicatorAllreduce(ByteBuffer sendrecvbuf, int count,
@@ -154,14 +171,16 @@ class XGBoostJNI {
   public final static native int XGDMatrixSetInfoFromInterface(
     long handle, String field, String json);
 
-  @Deprecated
-  public final static native int XGDeviceQuantileDMatrixCreateFromCallback(
-    java.util.Iterator<ColumnBatch> iter, float missing, int nthread, int maxBin, long[] out);
-
   public final static native int XGQuantileDMatrixCreateFromCallback(
-    java.util.Iterator<ColumnBatch> iter, java.util.Iterator<ColumnBatch> ref, String config, long[] out);
+    java.util.Iterator<ColumnBatch> iter, long[] ref, String config, long[] out);
 
   public final static native int XGDMatrixCreateFromArrayInterfaceColumns(
     String featureJson, float missing, int nthread, long[] out);
+
+  public final static native int XGBoosterSetStrFeatureInfo(long handle, String field, String[] features);
+
+  public final static native int XGBoosterGetStrFeatureInfo(long handle, String field, String[] out);
+
+  public final static native int XGDMatrixGetQuantileCut(long handle, long[][] outIndptr, float[][] outValues);
 
 }

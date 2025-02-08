@@ -42,8 +42,8 @@ int main() {
 
   // load the data
   DMatrixHandle dtrain, dtest;
-  safe_xgboost(XGDMatrixCreateFromFile("../../data/agaricus.txt.train", silent, &dtrain));
-  safe_xgboost(XGDMatrixCreateFromFile("../../data/agaricus.txt.test", silent, &dtest));
+  safe_xgboost(XGDMatrixCreateFromFile("../../data/agaricus.txt.train?format=libsvm", silent, &dtrain));
+  safe_xgboost(XGDMatrixCreateFromFile("../../data/agaricus.txt.test?format=libsvm", silent, &dtest));
 
   // create the booster
   BoosterHandle booster;
@@ -53,15 +53,7 @@ int main() {
   // configure the training
   // available parameters are described here:
   //   https://xgboost.readthedocs.io/en/latest/parameter.html
-  safe_xgboost(XGBoosterSetParam(booster, "tree_method", use_gpu ? "gpu_hist" : "hist"));
-  if (use_gpu) {
-    // set the GPU to use;
-    // this is not necessary, but provided here as an illustration
-    safe_xgboost(XGBoosterSetParam(booster, "gpu_id", "0"));
-  } else {
-    // avoid evaluating objective and metric on a GPU
-    safe_xgboost(XGBoosterSetParam(booster, "gpu_id", "-1"));
-  }
+  safe_xgboost(XGBoosterSetParam(booster, "device", use_gpu ? "cuda" : "cpu"));
 
   safe_xgboost(XGBoosterSetParam(booster, "objective", "binary:logistic"));
   safe_xgboost(XGBoosterSetParam(booster, "min_child_weight", "1"));

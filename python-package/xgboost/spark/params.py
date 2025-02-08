@@ -1,5 +1,7 @@
 """Xgboost pyspark integration submodule for params."""
-# pylint: disable=too-few-public-methods
+
+from typing import Dict
+
 from pyspark.ml.param import TypeConverters
 from pyspark.ml.param.shared import Param, Params
 
@@ -11,11 +13,11 @@ class HasArbitraryParamsDict(Params):
     input.
     """
 
-    arbitrary_params_dict: Param[dict] = Param(
+    arbitrary_params_dict: "Param[Dict]" = Param(
         Params._dummy(),
         "arbitrary_params_dict",
         "arbitrary_params_dict This parameter holds all of the additional parameters which are "
-        "not exposed as the the XGBoost Spark estimator params but can be recognized by "
+        "not exposed as the XGBoost Spark estimator params but can be recognized by "
         "underlying XGBoost library. It is stored as a dictionary.",
     )
 
@@ -53,7 +55,6 @@ class HasFeaturesCols(Params):
 
 
 class HasEnableSparseDataOptim(Params):
-
     """
     This is a Params based class that is extended by _SparkXGBParams
     and holds the variable to store the boolean config of enabling sparse data optimization.

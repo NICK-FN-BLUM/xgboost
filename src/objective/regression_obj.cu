@@ -1,5 +1,5 @@
 /**
- * Copyright 2015-2023 by XGBoost Contributors
+ * Copyright 2015-2024, XGBoost Contributors
  * \file regression_obj.cu
  * \brief Definition of single-value regression and classification objectives.
  * \author Tianqi Chen, Kailong Chen
@@ -35,13 +35,19 @@
 #include "xgboost/span.h"
 #include "xgboost/tree_model.h"  // RegTree
 
+#include "regression_param.h"
+
 #if defined(XGBOOST_USE_CUDA)
+#include "../common/cuda_context.cuh"  // for CUDAContext
 #include "../common/device_helpers.cuh"
 #include "../common/linalg_op.cuh"
 #endif  // defined(XGBOOST_USE_CUDA)
 
-namespace xgboost {
-namespace obj {
+#if defined(XGBOOST_USE_SYCL)
+#include "../../plugin/sycl/common/linalg_op.h"
+#endif
+
+namespace xgboost::obj {
 namespace {
 void CheckRegInputs(MetaInfo const& info, HostDeviceVector<bst_float> const& preds) {
   CheckInitInputs(info);
@@ -53,56 +59,86 @@ void CheckRegInputs(MetaInfo const& info, HostDeviceVector<bst_float> const& pre
 DMLC_REGISTRY_FILE_TAG(regression_obj_gpu);
 #endif  // defined(XGBOOST_USE_CUDA)
 
-struct RegLossParam : public XGBoostParameter<RegLossParam> {
-  float scale_pos_weight;
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(RegLossParam) {
-    DMLC_DECLARE_FIELD(scale_pos_weight).set_default(1.0f).set_lower_bound(0.0f)
-      .describe("Scale the weight of positive examples by this factor");
-  }
-};
+
 
 template<typename Loss>
-class RegLossObj : public FitIntercept {
+class RegLossObj : public FitInterceptGlmLike {
  protected:
   HostDeviceVector<float> additional_input_;
 
  public:
-  // 0 - label_correct flag, 1 - scale_pos_weight, 2 - is_null_weight
-  RegLossObj(): additional_input_(3) {}
+  void ValidateLabel(MetaInfo const& info) {
+    auto label = info.labels.View(ctx_->Device());
+    auto valid = ctx_->DispatchDevice(
+        [&] {
+          return std::all_of(linalg::cbegin(label), linalg::cend(label),
+                             [](float y) -> bool { return Loss::CheckLabel(y); });
+        },
+        [&] {
+#if defined(XGBOOST_USE_CUDA)
+          auto cuctx = ctx_->CUDACtx();
+          auto it = dh::MakeTransformIterator<bool>(
+              thrust::make_counting_iterator(0ul), [=] XGBOOST_DEVICE(std::size_t i) -> bool {
+                auto [m, n] = linalg::UnravelIndex(i, label.Shape());
+                return Loss::CheckLabel(label(m, n));
+              });
+          return dh::Reduce(cuctx->CTP(), it, it + label.Size(), true, thrust::logical_and<>{});
+#else
+          common::AssertGPUSupport();
+          return false;
+#endif  // defined(XGBOOST_USE_CUDA)
+        },
+        [&] {
+#if defined(XGBOOST_USE_SYCL)
+          return sycl::linalg::Validate(ctx_->Device(), label,
+                                        [](float y) -> bool { return Loss::CheckLabel(y); });
+#else
+          common::AssertSYCLSupport();
+          return false;
+#endif  // defined(XGBOOST_USE_SYCL)
+        });
+    if (!valid) {
+      LOG(FATAL) << Loss::LabelErrorMsg();
+    }
+  }
+  // 0 - scale_pos_weight, 1 - is_null_weight
+  RegLossObj(): additional_input_(2) {}
 
   void Configure(const std::vector<std::pair<std::string, std::string> >& args) override {
     param_.UpdateAllowUnknown(args);
   }
 
-  ObjInfo Task() const override { return Loss::Info(); }
+  [[nodiscard]] ObjInfo Task() const override { return Loss::Info(); }
 
-  bst_target_t Targets(MetaInfo const& info) const override {
+  [[nodiscard]] bst_target_t Targets(MetaInfo const& info) const override {
     // Multi-target regression.
-    return std::max(static_cast<size_t>(1), info.labels.Shape(1));
+    return std::max(static_cast<std::size_t>(1), info.labels.Shape(1));
   }
 
-  void GetGradient(const HostDeviceVector<bst_float>& preds,
-                   const MetaInfo &info, int,
-                   HostDeviceVector<GradientPair>* out_gpair) override {
+  void GetGradient(const HostDeviceVector<bst_float>& preds, const MetaInfo& info,
+                   std::int32_t iter, linalg::Matrix<GradientPair>* out_gpair) override {
     CheckRegInputs(info, preds);
+    if (iter == 0) {
+      ValidateLabel(info);
+    }
+
     size_t const ndata = preds.Size();
-    out_gpair->Resize(ndata);
-    auto device = ctx_->gpu_id;
-    additional_input_.HostVector().begin()[0] = 1;  // Fill the label_correct flag
+    out_gpair->SetDevice(ctx_->Device());
+    auto device = ctx_->Device();
 
     bool is_null_weight = info.weights_.Size() == 0;
     auto scale_pos_weight = param_.scale_pos_weight;
-    additional_input_.HostVector().begin()[1] = scale_pos_weight;
-    additional_input_.HostVector().begin()[2] = is_null_weight;
+    additional_input_.HostVector().begin()[0] = scale_pos_weight;
+    additional_input_.HostVector().begin()[1] = is_null_weight;
 
     const size_t nthreads = ctx_->Threads();
-    bool on_device = device >= 0;
+    bool on_device = !device.IsCPU();
     // On CPU we run the transformation each thread processing a contigious block of data
     // for better performance.
     const size_t n_data_blocks = std::max(static_cast<size_t>(1), (on_device ? ndata : nthreads));
     const size_t block_size = ndata / n_data_blocks + !!(ndata % n_data_blocks);
-    auto const n_targets = std::max(info.labels.Shape(1), static_cast<size_t>(1));
+    auto const n_targets = this->Targets(info);
+    out_gpair->Reshape(info.num_row_, n_targets);
 
     common::Transform<>::Init(
         [block_size, ndata, n_targets] XGBOOST_DEVICE(
@@ -117,8 +153,8 @@ class RegLossObj : public FitIntercept {
           GradientPair* out_gpair_ptr = _out_gpair.data();
           const size_t begin = data_block_idx*block_size;
           const size_t end = std::min(ndata, begin + block_size);
-          const float _scale_pos_weight = _additional_input[1];
-          const bool _is_null_weight = _additional_input[2];
+          const float _scale_pos_weight = _additional_input[0];
+          const bool _is_null_weight = _additional_input[1];
 
           for (size_t idx = begin; idx < end; ++idx) {
             bst_float p = Loss::PredTransform(preds_ptr[idx]);
@@ -127,26 +163,17 @@ class RegLossObj : public FitIntercept {
             if (label == 1.0f) {
               w *= _scale_pos_weight;
             }
-            if (!Loss::CheckLabel(label)) {
-              // If there is an incorrect label, the host code will know.
-              _additional_input[0] = 0;
-            }
             out_gpair_ptr[idx] = GradientPair(Loss::FirstOrderGradient(p, label) * w,
                                               Loss::SecondOrderGradient(p, label) * w);
           }
         },
         common::Range{0, static_cast<int64_t>(n_data_blocks)}, nthreads, device)
-        .Eval(&additional_input_, out_gpair, &preds, info.labels.Data(),
+        .Eval(&additional_input_, out_gpair->Data(), &preds, info.labels.Data(),
               &info.weights_);
-
-    auto const flag = additional_input_.HostVector().begin()[0];
-    if (flag == 0) {
-      LOG(FATAL) << Loss::LabelErrorMsg();
-    }
   }
 
  public:
-  const char* DefaultEvalMetric() const override {
+  [[nodiscard]] const char* DefaultEvalMetric() const override {
     return Loss::DefaultEvalMetric();
   }
 
@@ -156,11 +183,11 @@ class RegLossObj : public FitIntercept {
           _preds[_idx] = Loss::PredTransform(_preds[_idx]);
         },
         common::Range{0, static_cast<int64_t>(io_preds->Size())}, this->ctx_->Threads(),
-        io_preds->DeviceIdx())
+        io_preds->Device())
         .Eval(io_preds);
   }
 
-  float ProbToMargin(float base_score) const override {
+  [[nodiscard]] float ProbToMargin(float base_score) const override {
     return Loss::ProbToMargin(base_score);
   }
 
@@ -202,6 +229,10 @@ XGBOOST_REGISTER_OBJECTIVE(LogisticRaw, LogisticRaw::Name())
           "before logistic transformation.")
 .set_body([]() { return new RegLossObj<LogisticRaw>(); });
 
+XGBOOST_REGISTER_OBJECTIVE(GammaRegression, GammaDeviance::Name())
+    .describe("Gamma regression using the gamma deviance loss with log link.")
+    .set_body([]() { return new RegLossObj<GammaDeviance>(); });
+
 // Deprecated functions
 XGBOOST_REGISTER_OBJECTIVE(LinearRegression, "reg:linear")
 .describe("Regression with squared error.")
@@ -215,44 +246,44 @@ class PseudoHuberRegression : public FitIntercept {
 
  public:
   void Configure(Args const& args) override { param_.UpdateAllowUnknown(args); }
-  ObjInfo Task() const override { return ObjInfo::kRegression; }
-  bst_target_t Targets(MetaInfo const& info) const override {
-    return std::max(static_cast<size_t>(1), info.labels.Shape(1));
+  [[nodiscard]] ObjInfo Task() const override { return ObjInfo::kRegression; }
+  [[nodiscard]] bst_target_t Targets(MetaInfo const& info) const override {
+    return std::max(static_cast<std::size_t>(1), info.labels.Shape(1));
   }
 
   void GetGradient(HostDeviceVector<bst_float> const& preds, const MetaInfo& info, int /*iter*/,
-                   HostDeviceVector<GradientPair>* out_gpair) override {
+                   linalg::Matrix<GradientPair>* out_gpair) override {
     CheckRegInputs(info, preds);
     auto slope = param_.huber_slope;
     CHECK_NE(slope, 0.0) << "slope for pseudo huber cannot be 0.";
-    auto labels = info.labels.View(ctx_->gpu_id);
+    auto labels = info.labels.View(ctx_->Device());
 
-    out_gpair->SetDevice(ctx_->gpu_id);
-    out_gpair->Resize(info.labels.Size());
-    auto gpair = linalg::MakeVec(out_gpair);
+    out_gpair->SetDevice(ctx_->Device());
+    out_gpair->Reshape(info.num_row_, this->Targets(info));
+    auto gpair = out_gpair->View(ctx_->Device());
 
-    preds.SetDevice(ctx_->gpu_id);
-    auto predt = linalg::MakeVec(&preds);
+    preds.SetDevice(ctx_->Device());
+    auto predt = linalg::MakeTensorView(ctx_, &preds, info.num_row_, this->Targets(info));
 
-    info.weights_.SetDevice(ctx_->gpu_id);
+    info.weights_.SetDevice(ctx_->Device());
     common::OptionalWeights weight{ctx_->IsCPU() ? info.weights_.ConstHostSpan()
                                                  : info.weights_.ConstDeviceSpan()};
 
-    linalg::ElementWiseKernel(ctx_, labels, [=] XGBOOST_DEVICE(size_t i, float const y) mutable {
-      auto sample_id = std::get<0>(linalg::UnravelIndex(i, labels.Shape()));
-      const float z = predt(i) - y;
-      const float scale_sqrt = std::sqrt(1 + common::Sqr(z) / common::Sqr(slope));
-      float grad = z / scale_sqrt;
+    linalg::ElementWiseKernel(
+        ctx_, labels, [=] XGBOOST_DEVICE(std::size_t i, std::size_t j) mutable {
+          float z = predt(i, j) - labels(i, j);
+          float scale_sqrt = std::sqrt(1 + common::Sqr(z) / common::Sqr(slope));
+          float grad = z / scale_sqrt;
 
-      auto scale = common::Sqr(slope) + common::Sqr(z);
-      float hess = common::Sqr(slope) / (scale * scale_sqrt);
+          auto scale = common::Sqr(slope) + common::Sqr(z);
+          float hess = common::Sqr(slope) / (scale * scale_sqrt);
 
-      auto w = weight[sample_id];
-      gpair(i) = {grad * w, hess * w};
-    });
+          auto w = weight[i];
+          gpair(i) = {grad * w, hess * w};
+        });
   }
 
-  const char* DefaultEvalMetric() const override { return "mphe"; }
+  [[nodiscard]] const char* DefaultEvalMetric() const override { return "mphe"; }
 
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
@@ -267,6 +298,13 @@ class PseudoHuberRegression : public FitIntercept {
       return;
     }
     FromJson(in["pseudo_huber_param"], &param_);
+  }
+  [[nodiscard]] Json DefaultMetricConfig() const override {
+    CHECK(param_.GetInitialised());
+    Json config{Object{}};
+    config["name"] = String{this->DefaultEvalMetric()};
+    config["pseudo_huber_param"] = ToJson(param_);
+    return config;
   }
 };
 
@@ -285,23 +323,23 @@ struct PoissonRegressionParam : public XGBoostParameter<PoissonRegressionParam> 
 };
 
 // poisson regression for count
-class PoissonRegression : public FitIntercept {
+class PoissonRegression : public FitInterceptGlmLike {
  public:
   // declare functions
   void Configure(const std::vector<std::pair<std::string, std::string> >& args) override {
     param_.UpdateAllowUnknown(args);
   }
 
-  ObjInfo Task() const override { return ObjInfo::kRegression; }
+  [[nodiscard]] ObjInfo Task() const override { return ObjInfo::kRegression; }
 
-  void GetGradient(const HostDeviceVector<bst_float>& preds,
-                   const MetaInfo &info, int,
-                   HostDeviceVector<GradientPair> *out_gpair) override {
+  void GetGradient(const HostDeviceVector<bst_float>& preds, const MetaInfo& info, int,
+                   linalg::Matrix<GradientPair>* out_gpair) override {
     CHECK_NE(info.labels.Size(), 0U) << "label set cannot be empty";
     CHECK_EQ(preds.Size(), info.labels.Size()) << "labels are not correctly provided";
     size_t const ndata = preds.Size();
-    out_gpair->Resize(ndata);
-    auto device = ctx_->gpu_id;
+    out_gpair->SetDevice(ctx_->Device());
+    out_gpair->Reshape(info.num_row_, this->Targets(info));
+    auto device = ctx_->Device();
     label_correct_.Resize(1);
     label_correct_.Fill(1);
 
@@ -328,7 +366,7 @@ class PoissonRegression : public FitIntercept {
                                           expf(p + max_delta_step) * w};
         },
         common::Range{0, static_cast<int64_t>(ndata)}, this->ctx_->Threads(), device).Eval(
-            &label_correct_, out_gpair, &preds, info.labels.Data(), &info.weights_);
+            &label_correct_, out_gpair->Data(), &preds, info.labels.Data(), &info.weights_);
     // copy "label correct" flags back to host
     std::vector<int>& label_correct_h = label_correct_.HostVector();
     for (auto const flag : label_correct_h) {
@@ -343,16 +381,16 @@ class PoissonRegression : public FitIntercept {
           _preds[_idx] = expf(_preds[_idx]);
         },
         common::Range{0, static_cast<int64_t>(io_preds->Size())}, this->ctx_->Threads(),
-        io_preds->DeviceIdx())
+        io_preds->Device())
         .Eval(io_preds);
   }
   void EvalTransform(HostDeviceVector<bst_float> *io_preds) override {
     PredTransform(io_preds);
   }
-  bst_float ProbToMargin(bst_float base_score) const override {
+  [[nodiscard]] float ProbToMargin(bst_float base_score) const override {
     return std::log(base_score);
   }
-  const char* DefaultEvalMetric() const override {
+  [[nodiscard]] const char* DefaultEvalMetric() const override {
     return "poisson-nloglik";
   }
 
@@ -383,16 +421,15 @@ XGBOOST_REGISTER_OBJECTIVE(PoissonRegression, "count:poisson")
 class CoxRegression : public FitIntercept {
  public:
   void Configure(Args const&) override {}
-  ObjInfo Task() const override { return ObjInfo::kRegression; }
+  [[nodiscard]] ObjInfo Task() const override { return ObjInfo::kRegression; }
 
-  void GetGradient(const HostDeviceVector<bst_float>& preds,
-                   const MetaInfo &info, int,
-                   HostDeviceVector<GradientPair> *out_gpair) override {
+  void GetGradient(const HostDeviceVector<bst_float>& preds, const MetaInfo& info, int,
+                   linalg::Matrix<GradientPair>* out_gpair) override {
     CHECK_NE(info.labels.Size(), 0U) << "label set cannot be empty";
     CHECK_EQ(preds.Size(), info.labels.Size()) << "labels are not correctly provided";
     const auto& preds_h = preds.HostVector();
-    out_gpair->Resize(preds_h.size());
-    auto& gpair = out_gpair->HostVector();
+    out_gpair->Reshape(info.num_row_, this->Targets(info));
+    auto gpair = out_gpair->HostView();
     const std::vector<size_t> &label_order = info.LabelAbsSort(ctx_);
 
     const omp_ulong ndata = static_cast<omp_ulong>(preds_h.size()); // NOLINT(*)
@@ -440,8 +477,8 @@ class CoxRegression : public FitIntercept {
       }
 
       const double grad = exp_p*r_k - static_cast<bst_float>(y > 0);
-      const double hess = exp_p*r_k - exp_p*exp_p * s_k;
-      gpair.at(ind) = GradientPair(grad * w, hess * w);
+      const double hess = exp_p * r_k - exp_p * exp_p * s_k;
+      gpair(ind) = GradientPair(grad * w, hess * w);
 
       last_abs_y = abs_y;
       last_exp_p = exp_p;
@@ -457,10 +494,10 @@ class CoxRegression : public FitIntercept {
   void EvalTransform(HostDeviceVector<bst_float> *io_preds) override {
     PredTransform(io_preds);
   }
-  bst_float ProbToMargin(bst_float base_score) const override {
+  [[nodiscard]] float ProbToMargin(bst_float base_score) const override {
     return std::log(base_score);
   }
-  const char* DefaultEvalMetric() const override {
+  [[nodiscard]] const char* DefaultEvalMetric() const override {
     return "cox-nloglik";
   }
 
@@ -476,87 +513,6 @@ XGBOOST_REGISTER_OBJECTIVE(CoxRegression, "survival:cox")
 .describe("Cox regression for censored survival data (negative labels are considered censored).")
 .set_body([]() { return new CoxRegression(); });
 
-// gamma regression
-class GammaRegression : public FitIntercept {
- public:
-  void Configure(Args const&) override {}
-  ObjInfo Task() const override { return ObjInfo::kRegression; }
-
-  void GetGradient(const HostDeviceVector<bst_float> &preds,
-                   const MetaInfo &info, int,
-                   HostDeviceVector<GradientPair> *out_gpair) override {
-    CHECK_NE(info.labels.Size(), 0U) << "label set cannot be empty";
-    CHECK_EQ(preds.Size(), info.labels.Size()) << "labels are not correctly provided";
-    const size_t ndata = preds.Size();
-    auto device = ctx_->gpu_id;
-    out_gpair->Resize(ndata);
-    label_correct_.Resize(1);
-    label_correct_.Fill(1);
-
-    const bool is_null_weight = info.weights_.Size() == 0;
-    if (!is_null_weight) {
-      CHECK_EQ(info.weights_.Size(), ndata)
-          << "Number of weights should be equal to number of data points.";
-    }
-    common::Transform<>::Init(
-        [=] XGBOOST_DEVICE(size_t _idx,
-                           common::Span<int> _label_correct,
-                           common::Span<GradientPair> _out_gpair,
-                           common::Span<const bst_float> _preds,
-                           common::Span<const bst_float> _labels,
-                           common::Span<const bst_float> _weights) {
-          bst_float p = _preds[_idx];
-          bst_float w = is_null_weight ? 1.0f : _weights[_idx];
-          bst_float y = _labels[_idx];
-          if (y <= 0.0f) {
-            _label_correct[0] = 0;
-          }
-          _out_gpair[_idx] = GradientPair((1 - y / expf(p)) * w, y / expf(p) * w);
-        },
-        common::Range{0, static_cast<int64_t>(ndata)}, this->ctx_->Threads(), device).Eval(
-            &label_correct_, out_gpair, &preds, info.labels.Data(), &info.weights_);
-
-    // copy "label correct" flags back to host
-    std::vector<int>& label_correct_h = label_correct_.HostVector();
-    for (auto const flag : label_correct_h) {
-      if (flag == 0) {
-        LOG(FATAL) << "GammaRegression: label must be positive.";
-      }
-    }
-  }
-  void PredTransform(HostDeviceVector<bst_float> *io_preds) const override {
-    common::Transform<>::Init(
-        [] XGBOOST_DEVICE(size_t _idx, common::Span<bst_float> _preds) {
-          _preds[_idx] = expf(_preds[_idx]);
-        },
-        common::Range{0, static_cast<int64_t>(io_preds->Size())}, this->ctx_->Threads(),
-        io_preds->DeviceIdx())
-        .Eval(io_preds);
-  }
-  void EvalTransform(HostDeviceVector<bst_float> *io_preds) override {
-    PredTransform(io_preds);
-  }
-  bst_float ProbToMargin(bst_float base_score) const override {
-    return std::log(base_score);
-  }
-  const char* DefaultEvalMetric() const override {
-    return "gamma-nloglik";
-  }
-  void SaveConfig(Json* p_out) const override {
-    auto& out = *p_out;
-    out["name"] = String("reg:gamma");
-  }
-  void LoadConfig(Json const&) override {}
-
- private:
-  HostDeviceVector<int> label_correct_;
-};
-
-// register the objective functions
-XGBOOST_REGISTER_OBJECTIVE(GammaRegression, "reg:gamma")
-.describe("Gamma regression for severity data.")
-.set_body([]() { return new GammaRegression(); });
-
 
 // declare parameter
 struct TweedieRegressionParam : public XGBoostParameter<TweedieRegressionParam> {
@@ -568,7 +524,7 @@ struct TweedieRegressionParam : public XGBoostParameter<TweedieRegressionParam> 
 };
 
 // tweedie regression
-class TweedieRegression : public FitIntercept {
+class TweedieRegression : public FitInterceptGlmLike {
  public:
   // declare functions
   void Configure(const std::vector<std::pair<std::string, std::string> >& args) override {
@@ -578,17 +534,17 @@ class TweedieRegression : public FitIntercept {
     metric_ = os.str();
   }
 
-  ObjInfo Task() const override { return ObjInfo::kRegression; }
+  [[nodiscard]] ObjInfo Task() const override { return ObjInfo::kRegression; }
 
-  void GetGradient(const HostDeviceVector<bst_float>& preds,
-                   const MetaInfo &info, int,
-                   HostDeviceVector<GradientPair> *out_gpair) override {
+  void GetGradient(const HostDeviceVector<bst_float>& preds, const MetaInfo& info, std::int32_t,
+                   linalg::Matrix<GradientPair>* out_gpair) override {
     CHECK_NE(info.labels.Size(), 0U) << "label set cannot be empty";
     CHECK_EQ(preds.Size(), info.labels.Size()) << "labels are not correctly provided";
     const size_t ndata = preds.Size();
-    out_gpair->Resize(ndata);
+    out_gpair->SetDevice(ctx_->Device());
+    out_gpair->Reshape(info.num_row_, this->Targets(info));
 
-    auto device = ctx_->gpu_id;
+    auto device = ctx_->Device();
     label_correct_.Resize(1);
     label_correct_.Fill(1);
 
@@ -619,7 +575,7 @@ class TweedieRegression : public FitIntercept {
           _out_gpair[_idx] = GradientPair(grad * w, hess * w);
         },
         common::Range{0, static_cast<int64_t>(ndata), 1}, this->ctx_->Threads(), device)
-        .Eval(&label_correct_, out_gpair, &preds, info.labels.Data(), &info.weights_);
+        .Eval(&label_correct_, out_gpair->Data(), &preds, info.labels.Data(), &info.weights_);
 
     // copy "label correct" flags back to host
     std::vector<int>& label_correct_h = label_correct_.HostVector();
@@ -635,15 +591,15 @@ class TweedieRegression : public FitIntercept {
           _preds[_idx] = expf(_preds[_idx]);
         },
         common::Range{0, static_cast<int64_t>(io_preds->Size())}, this->ctx_->Threads(),
-        io_preds->DeviceIdx())
+        io_preds->Device())
         .Eval(io_preds);
   }
 
-  bst_float ProbToMargin(bst_float base_score) const override {
+  [[nodiscard]] float ProbToMargin(bst_float base_score) const override {
     return std::log(base_score);
   }
 
-  const char* DefaultEvalMetric() const override {
+  [[nodiscard]] const char* DefaultEvalMetric() const override {
     return metric_.c_str();
   }
 
@@ -672,35 +628,36 @@ XGBOOST_REGISTER_OBJECTIVE(TweedieRegression, "reg:tweedie")
 class MeanAbsoluteError : public ObjFunction {
  public:
   void Configure(Args const&) override {}
-  ObjInfo Task() const override { return {ObjInfo::kRegression, true, true}; }
-  bst_target_t Targets(MetaInfo const& info) const override {
-    return std::max(static_cast<size_t>(1), info.labels.Shape(1));
+  [[nodiscard]] ObjInfo Task() const override { return {ObjInfo::kRegression, true, true}; }
+  [[nodiscard]] bst_target_t Targets(MetaInfo const& info) const override {
+    return std::max(static_cast<std::size_t>(1), info.labels.Shape(1));
   }
 
-  void GetGradient(HostDeviceVector<bst_float> const& preds, const MetaInfo& info, int /*iter*/,
-                   HostDeviceVector<GradientPair>* out_gpair) override {
+  void GetGradient(HostDeviceVector<float> const& preds, const MetaInfo& info,
+                   std::int32_t /*iter*/, linalg::Matrix<GradientPair>* out_gpair) override {
     CheckRegInputs(info, preds);
-    auto labels = info.labels.View(ctx_->gpu_id);
+    auto labels = info.labels.View(ctx_->Device());
 
-    out_gpair->SetDevice(ctx_->gpu_id);
-    out_gpair->Resize(info.labels.Size());
-    auto gpair = linalg::MakeVec(out_gpair);
+    out_gpair->SetDevice(ctx_->Device());
+    out_gpair->Reshape(info.num_row_, this->Targets(info));
+    auto gpair = out_gpair->View(ctx_->Device());
 
-    preds.SetDevice(ctx_->gpu_id);
-    auto predt = linalg::MakeVec(&preds);
-    info.weights_.SetDevice(ctx_->gpu_id);
+    preds.SetDevice(ctx_->Device());
+    auto predt = linalg::MakeTensorView(ctx_, &preds, info.num_row_, this->Targets(info));
+    info.weights_.SetDevice(ctx_->Device());
     common::OptionalWeights weight{ctx_->IsCPU() ? info.weights_.ConstHostSpan()
                                                  : info.weights_.ConstDeviceSpan()};
 
-    linalg::ElementWiseKernel(ctx_, labels, [=] XGBOOST_DEVICE(size_t i, float const y) mutable {
-      auto sign = [](auto x) {
-        return (x > static_cast<decltype(x)>(0)) - (x < static_cast<decltype(x)>(0));
-      };
-      auto sample_id = std::get<0>(linalg::UnravelIndex(i, labels.Shape()));
-      auto grad = sign(predt(i) - y) * weight[sample_id];
-      auto hess = weight[sample_id];
-      gpair(i) = GradientPair{grad, hess};
-    });
+    linalg::ElementWiseKernel(
+        ctx_, labels, [=] XGBOOST_DEVICE(std::size_t i, std::size_t j) mutable {
+          auto sign = [](auto x) {
+            return (x > static_cast<decltype(x)>(0)) - (x < static_cast<decltype(x)>(0));
+          };
+          auto y = labels(i, j);
+          auto hess = weight[i];
+          auto grad = sign(predt(i, j) - y) * hess;
+          gpair(i, j) = GradientPair{grad, hess};
+        });
   }
 
   void InitEstimation(MetaInfo const& info, linalg::Tensor<float, 1>* base_margin) const override {
@@ -728,8 +685,12 @@ class MeanAbsoluteError : public ObjFunction {
     std::transform(linalg::cbegin(out), linalg::cend(out), linalg::begin(out),
                    [w](float v) { return v * w; });
 
-    collective::Allreduce<collective::Operation::kSum>(out.Values().data(), out.Values().size());
-    collective::Allreduce<collective::Operation::kSum>(&w, 1);
+    auto rc = collective::Success() << [&] {
+      return collective::GlobalSum(ctx_, info, out);
+    } << [&] {
+      return collective::GlobalSum(ctx_, info, linalg::MakeVec(&w, 1));
+    };
+    collective::SafeColl(rc);
 
     if (common::CloseTo(w, 0.0)) {
       // Mostly for handling empty dataset test.
@@ -748,7 +709,7 @@ class MeanAbsoluteError : public ObjFunction {
                                    p_tree);
   }
 
-  const char* DefaultEvalMetric() const override { return "mae"; }
+  [[nodiscard]] const char* DefaultEvalMetric() const override { return "mae"; }
 
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
@@ -763,5 +724,4 @@ class MeanAbsoluteError : public ObjFunction {
 XGBOOST_REGISTER_OBJECTIVE(MeanAbsoluteError, "reg:absoluteerror")
     .describe("Mean absoluate error.")
     .set_body([]() { return new MeanAbsoluteError(); });
-}  // namespace obj
-}  // namespace xgboost
+}  // namespace xgboost::obj

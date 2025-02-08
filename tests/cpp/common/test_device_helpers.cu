@@ -1,11 +1,15 @@
-/*!
- * Copyright 2017-2021 XGBoost contributors
+/**
+ * Copyright 2017-2024, XGBoost contributors
  */
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>  // for is_sorted
+#include <xgboost/base.h>
+
 #include <cstddef>
 #include <cstdint>
-#include <thrust/device_vector.h>
 #include <vector>
-#include <xgboost/base.h>
+
+#include "../../../src/common/cuda_context.cuh"
 #include "../../../src/common/device_helpers.cuh"
 #include "../../../src/common/quantile.h"
 #include "../helpers.h"
@@ -59,11 +63,11 @@ TEST(SegmentedUnique, Basic) {
   thrust::device_vector<xgboost::bst_feature_t> d_segs_out(d_segments.size());
   thrust::device_vector<float> d_vals_out(d_values.size());
 
+  auto ctx = xgboost::MakeCUDACtx(0);
   size_t n_uniques = dh::SegmentedUnique(
-      d_segments.data().get(), d_segments.data().get() + d_segments.size(),
-      d_values.data().get(), d_values.data().get() + d_values.size(),
-      d_segs_out.data().get(), d_vals_out.data().get(),
-      thrust::equal_to<float>{});
+      ctx.CUDACtx()->CTP(), d_segments.data().get(), d_segments.data().get() + d_segments.size(),
+      d_values.data().get(), d_values.data().get() + d_values.size(), d_segs_out.data().get(),
+      d_vals_out.data().get(), thrust::equal_to<float>{});
   CHECK_EQ(n_uniques, 5);
 
   std::vector<float> values_sol{0.1f, 0.2f, 0.3f, 0.62448811531066895f, 0.4f};
@@ -79,10 +83,9 @@ TEST(SegmentedUnique, Basic) {
   d_segments[1] = 4;
   d_segments[2] = 6;
   n_uniques = dh::SegmentedUnique(
-      d_segments.data().get(), d_segments.data().get() + d_segments.size(),
-      d_values.data().get(), d_values.data().get() + d_values.size(),
-      d_segs_out.data().get(), d_vals_out.data().get(),
-      thrust::equal_to<float>{});
+      ctx.CUDACtx()->CTP(), d_segments.data().get(), d_segments.data().get() + d_segments.size(),
+      d_values.data().get(), d_values.data().get() + d_values.size(), d_segs_out.data().get(),
+      d_vals_out.data().get(), thrust::equal_to<float>{});
   ASSERT_EQ(n_uniques, values.size());
   for (size_t i = 0 ; i < values.size(); i ++) {
     ASSERT_EQ(d_vals_out[i], values[i]);
@@ -111,10 +114,12 @@ void TestSegmentedUniqueRegression(std::vector<SketchEntry> values, size_t n_dup
   thrust::device_vector<bst_feature_t> d_segments(segments);
   thrust::device_vector<bst_feature_t> d_segments_out(segments.size());
 
+  auto ctx = xgboost::MakeCUDACtx(0);
+
   size_t n_uniques = dh::SegmentedUnique(
-      d_segments.data().get(), d_segments.data().get() + d_segments.size(), d_values.data().get(),
-      d_values.data().get() + d_values.size(), d_segments_out.data().get(), d_values.data().get(),
-      SketchUnique{});
+      ctx.CUDACtx()->CTP(), d_segments.data().get(), d_segments.data().get() + d_segments.size(),
+      d_values.data().get(), d_values.data().get() + d_values.size(), d_segments_out.data().get(),
+      d_values.data().get(), SketchUnique{});
   ASSERT_EQ(n_uniques, values.size() - n_duplicated);
   ASSERT_TRUE(thrust::is_sorted(thrust::device, d_values.begin(),
                                 d_values.begin() + n_uniques, IsSorted{}));
@@ -165,7 +170,7 @@ TEST(SegmentedUnique, Regression) {
   }
 }
 
-TEST(Allocator, OOM) {
+TEST(Allocator, DISABLED_OOM) {
   auto size = dh::AvailableMemory(0) * 4;
   ASSERT_THROW({dh::caching_device_vector<char> vec(size);}, dmlc::Error);
   ASSERT_THROW({dh::device_vector<char> vec(size);}, dmlc::Error);

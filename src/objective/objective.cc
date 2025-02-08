@@ -18,7 +18,8 @@ DMLC_REGISTRY_ENABLE(::xgboost::ObjFunctionReg);
 namespace xgboost {
 // implement factory functions
 ObjFunction* ObjFunction::Create(const std::string& name, Context const* ctx) {
-  auto *e = ::dmlc::Registry< ::xgboost::ObjFunctionReg>::Get()->Find(name);
+  std::string obj_name = name;
+  auto *e = ::dmlc::Registry< ::xgboost::ObjFunctionReg>::Get()->Find(obj_name);
   if (e == nullptr) {
     std::stringstream ss;
     for (const auto& entry : ::dmlc::Registry< ::xgboost::ObjFunctionReg>::List()) {
@@ -47,13 +48,14 @@ DMLC_REGISTRY_LINK_TAG(regression_obj_gpu);
 DMLC_REGISTRY_LINK_TAG(quantile_obj_gpu);
 DMLC_REGISTRY_LINK_TAG(hinge_obj_gpu);
 DMLC_REGISTRY_LINK_TAG(multiclass_obj_gpu);
-DMLC_REGISTRY_LINK_TAG(rank_obj_gpu);
+DMLC_REGISTRY_LINK_TAG(lambdarank_obj);
+DMLC_REGISTRY_LINK_TAG(lambdarank_obj_cu);
 #else
 DMLC_REGISTRY_LINK_TAG(regression_obj);
 DMLC_REGISTRY_LINK_TAG(quantile_obj);
 DMLC_REGISTRY_LINK_TAG(hinge_obj);
 DMLC_REGISTRY_LINK_TAG(multiclass_obj);
-DMLC_REGISTRY_LINK_TAG(rank_obj);
+DMLC_REGISTRY_LINK_TAG(lambdarank_obj);
 #endif  // XGBOOST_USE_CUDA
 }  // namespace obj
 }  // namespace xgboost

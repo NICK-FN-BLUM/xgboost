@@ -7,17 +7,17 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-from xgboost import DataIter, DMatrix, QuantileDMatrix, XGBModel
-from xgboost.compat import concat
-
 from .._typing import ArrayLike
-from .utils import get_logger  # type: ignore
+from ..compat import concat
+from ..core import DataIter, DMatrix, QuantileDMatrix
+from ..sklearn import XGBModel
+from .utils import get_logger
 
 
 def stack_series(series: pd.Series) -> np.ndarray:
     """Stack a series of arrays."""
     array = series.to_numpy(copy=False)
-    array = np.stack(array)
+    array = np.stack(array)  # type: ignore
     return array
 
 
@@ -77,15 +77,15 @@ class PartIter(DataIter):
         self._data = data
         self._kwargs = kwargs
 
-        super().__init__()
+        super().__init__(release_data=True)
 
     def _fetch(self, data: Optional[Sequence[pd.DataFrame]]) -> Optional[pd.DataFrame]:
         if not data:
             return None
 
         if self._device_id is not None:
-            import cudf  # pylint: disable=import-error
-            import cupy as cp  # pylint: disable=import-error
+            import cudf
+            import cupy as cp
 
             # We must set the device after import cudf, which will change the device id to 0
             # See https://github.com/rapidsai/cudf/issues/11386
@@ -94,9 +94,9 @@ class PartIter(DataIter):
 
         return data[self._iter]
 
-    def next(self, input_data: Callable) -> int:
+    def next(self, input_data: Callable) -> bool:
         if self._iter == len(self._data[alias.data]):
-            return 0
+            return False
         input_data(
             data=self._fetch(self._data[alias.data]),
             label=self._fetch(self._data.get(alias.label, None)),
@@ -106,7 +106,7 @@ class PartIter(DataIter):
             **self._kwargs,
         )
         self._iter += 1
-        return 1
+        return True
 
     def reset(self) -> None:
         self._iter = 0
@@ -157,7 +157,7 @@ def _read_csr_matrix_from_unwrapped_spark_vec(part: pd.DataFrame) -> csr_matrix:
 
 def make_qdm(
     data: Dict[str, List[np.ndarray]],
-    gpu_id: Optional[int],
+    dev_ordinal: Optional[int],
     meta: Dict[str, Any],
     ref: Optional[DMatrix],
     params: Dict[str, Any],
@@ -165,15 +165,16 @@ def make_qdm(
     """Handle empty partition for QuantileDMatrix."""
     if not data:
         return QuantileDMatrix(np.empty((0, 0)), ref=ref)
-    it = PartIter(data, gpu_id, **meta)
+    it = PartIter(data, dev_ordinal, **meta)
     m = QuantileDMatrix(it, **params, ref=ref)
     return m
 
 
 def create_dmatrix_from_partitions(  # pylint: disable=too-many-arguments
+    *,
     iterator: Iterator[pd.DataFrame],
     feature_cols: Optional[Sequence[str]],
-    gpu_id: Optional[int],
+    dev_ordinal: Optional[int],
     use_qdm: bool,
     kwargs: Dict[str, Any],  # use dict to make sure this parameter is passed.
     enable_sparse_data_optim: bool,
@@ -187,7 +188,7 @@ def create_dmatrix_from_partitions(  # pylint: disable=too-many-arguments
         Pyspark partition iterator.
     feature_cols:
         A sequence of feature names, used only when rapids plugin is enabled.
-    gpu_id:
+    dev_ordinal:
         Device ordinal, used when GPU is enabled.
     use_qdm :
         Whether QuantileDMatrix should be used instead of DMatrix.
@@ -219,7 +220,9 @@ def create_dmatrix_from_partitions(  # pylint: disable=too-many-arguments
                 array: Optional[np.ndarray] = part[feature_cols]
             elif part[name].shape[0] > 0:
                 array = part[name]
-                array = stack_series(array)
+                if name == alias.data:
+                    # For the array/vector typed case.
+                    array = stack_series(array)
             else:
                 array = None
 
@@ -302,13 +305,13 @@ def create_dmatrix_from_partitions(  # pylint: disable=too-many-arguments
 
     if feature_cols is not None and use_qdm:
         cache_partitions(iterator, append_fn)
-        dtrain: DMatrix = make_qdm(train_data, gpu_id, meta, None, params)
+        dtrain: DMatrix = make_qdm(train_data, dev_ordinal, meta, None, params)
     elif feature_cols is not None and not use_qdm:
         cache_partitions(iterator, append_fn)
         dtrain = make(train_data, kwargs)
     elif feature_cols is None and use_qdm:
         cache_partitions(iterator, append_fn)
-        dtrain = make_qdm(train_data, gpu_id, meta, None, params)
+        dtrain = make_qdm(train_data, dev_ordinal, meta, None, params)
     else:
         cache_partitions(iterator, append_fn)
         dtrain = make(train_data, kwargs)
@@ -322,7 +325,7 @@ def create_dmatrix_from_partitions(  # pylint: disable=too-many-arguments
     if has_validation_col:
         if use_qdm:
             dvalid: Optional[DMatrix] = make_qdm(
-                valid_data, gpu_id, meta, dtrain, params
+                valid_data, dev_ordinal, meta, dtrain, params
             )
         else:
             dvalid = make(valid_data, kwargs) if has_validation_col else None

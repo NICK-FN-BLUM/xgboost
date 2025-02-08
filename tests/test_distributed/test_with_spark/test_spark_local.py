@@ -4,17 +4,11 @@ import random
 import tempfile
 import uuid
 from collections import namedtuple
-from typing import Generator, Sequence, Type
+from typing import Generator, Iterable, List, Sequence
 
 import numpy as np
 import pytest
-
-import xgboost as xgb
-from xgboost import testing as tm
-from xgboost.spark.data import pred_contribs
-
-pytestmark = [tm.timeout(60), pytest.mark.skipif(**tm.no_spark())]
-
+from pyspark import SparkConf
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import VectorAssembler
@@ -24,7 +18,10 @@ from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as spark_sql_func
 
+import xgboost as xgb
 from xgboost import XGBClassifier, XGBModel, XGBRegressor
+from xgboost import testing as tm
+from xgboost.collective import Config
 from xgboost.spark import (
     SparkXGBClassifier,
     SparkXGBClassifierModel,
@@ -33,10 +30,13 @@ from xgboost.spark import (
     SparkXGBRegressorModel,
 )
 from xgboost.spark.core import _non_booster_params
+from xgboost.spark.data import pred_contribs
 
 from .utils import SparkTestCase
 
 logging.getLogger("py4j").setLevel(logging.INFO)
+
+pytestmark = [tm.timeout(60), pytest.mark.skipif(**tm.no_spark())]
 
 
 def no_sparse_unwrap() -> tm.PytestSkip:
@@ -79,6 +79,8 @@ RegWithWeight = namedtuple(
         "reg_df_test_with_eval_weight",
         "reg_with_eval_best_score",
         "reg_with_eval_and_weight_best_score",
+        "reg_expected_evals_result_train",
+        "reg_expected_evals_result_validation",
     ),
 )
 
@@ -128,6 +130,14 @@ def reg_with_weight(
     predt3 = reg3.predict(X)
     best_score3 = reg3.best_score
 
+    reg4 = XGBRegressor(eval_metric="rmse")
+    reg4.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_val, y_val)])
+    reg_expected_evals_result = reg4.evals_result()
+    reg_expected_evals_result_train = reg_expected_evals_result["validation_0"]["rmse"]
+    reg_expected_evals_result_validation = reg_expected_evals_result["validation_1"][
+        "rmse"
+    ]
+
     reg_df_train_with_eval_weight = spark.createDataFrame(
         [
             (Vectors.dense(1.0, 2.0, 3.0), 0, False, 1.0),
@@ -166,6 +176,8 @@ def reg_with_weight(
         reg_df_test_with_eval_weight,
         best_score2,
         best_score3,
+        reg_expected_evals_result_train,
+        reg_expected_evals_result_validation,
     )
 
 
@@ -288,6 +300,8 @@ ClfWithWeight = namedtuple(
         "cls_df_test_with_eval_weight",
         "cls_with_eval_best_score",
         "cls_with_eval_and_weight_best_score",
+        "cls_expected_evals_result_train",
+        "cls_expected_evals_result_validation",
     ),
 )
 
@@ -310,25 +324,31 @@ def clf_with_weight(
     y_val = np.array([0, 1])
     w_train = np.array([1.0, 2.0])
     w_val = np.array([1.0, 2.0])
-    cls2 = XGBClassifier()
+    cls2 = XGBClassifier(eval_metric="logloss", early_stopping_rounds=1)
     cls2.fit(
         X_train,
         y_train,
         eval_set=[(X_val, y_val)],
-        early_stopping_rounds=1,
-        eval_metric="logloss",
     )
 
-    cls3 = XGBClassifier()
+    cls3 = XGBClassifier(eval_metric="logloss", early_stopping_rounds=1)
     cls3.fit(
         X_train,
         y_train,
         sample_weight=w_train,
         eval_set=[(X_val, y_val)],
         sample_weight_eval_set=[w_val],
-        early_stopping_rounds=1,
-        eval_metric="logloss",
     )
+
+    cls4 = XGBClassifier(eval_metric="logloss")
+    cls4.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_train, y_train), (X_val, y_val)],
+    )
+    cls4_evals_result = cls4.evals_result()
+    cls_expected_evals_result_train = cls4_evals_result["validation_0"]["logloss"]
+    cls_expected_evals_result_validation = cls4_evals_result["validation_1"]["logloss"]
 
     cls_df_train_with_eval_weight = spark.createDataFrame(
         [
@@ -368,6 +388,8 @@ def clf_with_weight(
         cls_df_test_with_eval_weight,
         cls_with_eval_best_score,
         cls_with_eval_and_weight_best_score,
+        cls_expected_evals_result_train,
+        cls_expected_evals_result_validation,
     )
 
 
@@ -456,7 +478,9 @@ def check_sub_dict_match(
             assert sub_dist[k] == whole_dict[k], f"check on {k} failed"
 
 
-def get_params_map(params_kv: dict, estimator: Type) -> dict:
+def get_params_map(
+    params_kv: dict, estimator: xgb.spark.core._SparkXGBEstimator
+) -> dict:
     return {getattr(estimator, k): v for k, v in params_kv.items()}
 
 
@@ -464,6 +488,7 @@ class TestPySparkLocal:
     def test_regressor_basic(self, reg_data: RegData) -> None:
         regressor = SparkXGBRegressor(pred_contrib_col="pred_contribs")
         model = regressor.fit(reg_data.reg_df_train)
+        assert regressor.uid == model.uid
         pred_result = model.transform(reg_data.reg_df_test).collect()
         for row in pred_result:
             np.testing.assert_equal(row.prediction, row.expected_prediction)
@@ -740,11 +765,6 @@ class TestPySparkLocal:
         with pytest.raises(ValueError, match="early_stopping_rounds"):
             classifier.fit(clf_data.cls_df_train)
 
-    def test_gpu_param_setting(self, clf_data: ClfData) -> None:
-        py_cls = SparkXGBClassifier(use_gpu=True)
-        train_params = py_cls._get_distributed_train_params(clf_data.cls_df_train)
-        assert train_params["tree_method"] == "gpu_hist"
-
     def test_classifier_with_list_eval_metric(self, clf_data: ClfData) -> None:
         classifier = SparkXGBClassifier(eval_metric=["auc", "rmse"])
         model = classifier.fit(clf_data.cls_df_train)
@@ -754,6 +774,53 @@ class TestPySparkLocal:
         classifier = SparkXGBClassifier(eval_metric="auc")
         model = classifier.fit(clf_data.cls_df_train)
         model.transform(clf_data.cls_df_test).collect()
+
+    def test_regressor_params_basic(self) -> None:
+        py_reg = SparkXGBRegressor()
+        assert hasattr(py_reg, "n_estimators")
+        assert py_reg.n_estimators.parent == py_reg.uid
+        assert not hasattr(py_reg, "gpu_id")
+        assert hasattr(py_reg, "device")
+        assert py_reg.getOrDefault(py_reg.n_estimators) == 100
+        assert py_reg.getOrDefault(getattr(py_reg, "objective")), "reg:squarederror"
+        py_reg2 = SparkXGBRegressor(n_estimators=200)
+        assert py_reg2.getOrDefault(getattr(py_reg2, "n_estimators")), 200
+        py_reg3 = py_reg2.copy({getattr(py_reg2, "max_depth"): 10})
+        assert py_reg3.getOrDefault(getattr(py_reg3, "n_estimators")), 200
+        assert py_reg3.getOrDefault(getattr(py_reg3, "max_depth")), 10
+
+    def test_classifier_params_basic(self) -> None:
+        py_clf = SparkXGBClassifier()
+        assert hasattr(py_clf, "n_estimators")
+        assert py_clf.n_estimators.parent == py_clf.uid
+        assert not hasattr(py_clf, "gpu_id")
+        assert hasattr(py_clf, "device")
+
+        assert py_clf.getOrDefault(py_clf.n_estimators) == 100
+        assert py_clf.getOrDefault(getattr(py_clf, "objective")) is None
+        py_clf2 = SparkXGBClassifier(n_estimators=200)
+        assert py_clf2.getOrDefault(getattr(py_clf2, "n_estimators")) == 200
+        py_clf3 = py_clf2.copy({getattr(py_clf2, "max_depth"): 10})
+        assert py_clf3.getOrDefault(getattr(py_clf3, "n_estimators")) == 200
+        assert py_clf3.getOrDefault(getattr(py_clf3, "max_depth")), 10
+
+    def test_classifier_kwargs_basic(self, clf_data: ClfData) -> None:
+        py_clf = SparkXGBClassifier(**clf_data.cls_params)
+        assert hasattr(py_clf, "n_estimators")
+        assert py_clf.n_estimators.parent == py_clf.uid
+        assert not hasattr(py_clf, "gpu_id")
+        assert hasattr(py_clf, "device")
+        assert hasattr(py_clf, "arbitrary_params_dict")
+        assert py_clf.getOrDefault(py_clf.arbitrary_params_dict) == {}
+
+        # Testing overwritten params
+        py_clf = SparkXGBClassifier()
+        py_clf.setParams(x=1, y=2)
+        py_clf.setParams(y=3, z=4)
+        xgb_params = py_clf._gen_xgb_params_dict()
+        assert xgb_params["x"] == 1
+        assert xgb_params["y"] == 3
+        assert xgb_params["z"] == 4
 
     def test_regressor_model_save_load(self, reg_data: RegData) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -824,6 +891,421 @@ class TestPySparkLocal:
                     row.prediction, row.expected_prediction_with_params, atol=1e-3
                 )
             assert_model_compatible(model.stages[0], tmpdir)
+
+    def test_with_small_model_chunk_size(self, reg_data: RegData, monkeypatch) -> None:
+        import xgboost.spark.core
+
+        monkeypatch.setattr(xgboost.spark.core, "_MODEL_CHUNK_SIZE", 4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = "file:" + tmpdir
+            regressor = SparkXGBRegressor(**reg_data.reg_params)
+            model = regressor.fit(reg_data.reg_df_train)
+            model.save(path)
+            loaded_model = SparkXGBRegressorModel.load(path)
+            assert model.uid == loaded_model.uid
+            for k, v in reg_data.reg_params.items():
+                assert loaded_model.getOrDefault(k) == v
+
+            pred_result = loaded_model.transform(reg_data.reg_df_test).collect()
+            for row in pred_result:
+                assert np.isclose(
+                    row.prediction, row.expected_prediction_with_params, atol=1e-3
+                )
+
+    def test_device_param(self, reg_data: RegData, clf_data: ClfData) -> None:
+        clf = SparkXGBClassifier(device="cuda", tree_method="exact")
+        with pytest.raises(ValueError, match="not supported for distributed"):
+            clf.fit(clf_data.cls_df_train)
+        regressor = SparkXGBRegressor(device="cuda", tree_method="exact")
+        with pytest.raises(ValueError, match="not supported for distributed"):
+            regressor.fit(reg_data.reg_df_train)
+
+        reg = SparkXGBRegressor(device="cuda", tree_method="gpu_hist")
+        reg._validate_params()
+        reg = SparkXGBRegressor(device="cuda")
+        reg._validate_params()
+
+        clf = SparkXGBClassifier(device="cuda", tree_method="gpu_hist")
+        clf._validate_params()
+        clf = SparkXGBClassifier(device="cuda")
+        clf._validate_params()
+
+    def test_gpu_params(self) -> None:
+        clf = SparkXGBClassifier()
+        assert not clf._run_on_gpu()
+
+        clf = SparkXGBClassifier(device="cuda", tree_method="hist")
+        assert clf._run_on_gpu()
+
+        clf = SparkXGBClassifier(device="cuda")
+        assert clf._run_on_gpu()
+
+        clf = SparkXGBClassifier(tree_method="gpu_hist")
+        assert clf._run_on_gpu()
+
+        clf = SparkXGBClassifier(use_gpu=True)
+        assert clf._run_on_gpu()
+
+    def test_gpu_transform(self, clf_data: ClfData) -> None:
+        """local mode"""
+        classifier = SparkXGBClassifier(device="cpu")
+        model: SparkXGBClassifierModel = classifier.fit(clf_data.cls_df_train)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = "file:" + tmpdir
+            model.write().overwrite().save(path)
+
+            # The model trained with CPU, transform defaults to cpu
+            assert not model._run_on_gpu()
+
+            # without error
+            model.transform(clf_data.cls_df_test).collect()
+
+            model.set_device("cuda")
+            assert model._run_on_gpu()
+
+            model_loaded = SparkXGBClassifierModel.load(path)
+
+            # The model trained with CPU, transform defaults to cpu
+            assert not model_loaded._run_on_gpu()
+            # without error
+            model_loaded.transform(clf_data.cls_df_test).collect()
+
+            model_loaded.set_device("cuda")
+            assert model_loaded._run_on_gpu()
+
+    def test_validate_gpu_params(self) -> None:
+        # Standalone
+        standalone_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+        classifer_on_cpu = SparkXGBClassifier(use_gpu=False)
+        classifer_on_gpu = SparkXGBClassifier(use_gpu=True)
+
+        # No exception for classifier on CPU
+        classifer_on_cpu._validate_gpu_params("3.4.0", standalone_conf)
+
+        with pytest.raises(
+            ValueError, match="XGBoost doesn't support GPU fractional configurations"
+        ):
+            classifer_on_gpu._validate_gpu_params("3.3.0", standalone_conf)
+
+        # No issues
+        classifer_on_gpu._validate_gpu_params("3.4.0", standalone_conf)
+        classifer_on_gpu._validate_gpu_params("3.4.1", standalone_conf)
+        classifer_on_gpu._validate_gpu_params("3.5.0", standalone_conf)
+        classifer_on_gpu._validate_gpu_params("3.5.1", standalone_conf)
+
+        # no spark.executor.resource.gpu.amount
+        standalone_bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+        msg_match = (
+            "The `spark.executor.resource.gpu.amount` is required for training on GPU"
+        )
+        with pytest.raises(ValueError, match=msg_match):
+            classifer_on_gpu._validate_gpu_params("3.3.0", standalone_bad_conf)
+        with pytest.raises(ValueError, match=msg_match):
+            classifer_on_gpu._validate_gpu_params("3.4.0", standalone_bad_conf)
+        with pytest.raises(ValueError, match=msg_match):
+            classifer_on_gpu._validate_gpu_params("3.4.1", standalone_bad_conf)
+        with pytest.raises(ValueError, match=msg_match):
+            classifer_on_gpu._validate_gpu_params("3.5.0", standalone_bad_conf)
+        with pytest.raises(ValueError, match=msg_match):
+            classifer_on_gpu._validate_gpu_params("3.5.1", standalone_bad_conf)
+
+        standalone_bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+        )
+        msg_match = (
+            "The `spark.task.resource.gpu.amount` is required for training on GPU"
+        )
+        with pytest.raises(ValueError, match=msg_match):
+            classifer_on_gpu._validate_gpu_params("3.3.0", standalone_bad_conf)
+
+        classifer_on_gpu._validate_gpu_params("3.4.0", standalone_bad_conf)
+        classifer_on_gpu._validate_gpu_params("3.5.0", standalone_bad_conf)
+        classifer_on_gpu._validate_gpu_params("3.5.1", standalone_bad_conf)
+
+        # Yarn and K8s mode
+        for mode in ["yarn", "k8s://"]:
+            conf = (
+                SparkConf()
+                .setMaster(mode)
+                .set("spark.executor.cores", "12")
+                .set("spark.task.cpus", "1")
+                .set("spark.executor.resource.gpu.amount", "1")
+                .set("spark.task.resource.gpu.amount", "0.08")
+            )
+            with pytest.raises(
+                ValueError,
+                match="XGBoost doesn't support GPU fractional configurations",
+            ):
+                classifer_on_gpu._validate_gpu_params("3.3.0", conf)
+            with pytest.raises(
+                ValueError,
+                match="XGBoost doesn't support GPU fractional configurations",
+            ):
+                classifer_on_gpu._validate_gpu_params("3.4.0", conf)
+            with pytest.raises(
+                ValueError,
+                match="XGBoost doesn't support GPU fractional configurations",
+            ):
+                classifer_on_gpu._validate_gpu_params("3.4.1", conf)
+            with pytest.raises(
+                ValueError,
+                match="XGBoost doesn't support GPU fractional configurations",
+            ):
+                classifer_on_gpu._validate_gpu_params("3.5.0", conf)
+
+            classifer_on_gpu._validate_gpu_params("3.5.1", conf)
+
+        for mode in ["yarn", "k8s://"]:
+            bad_conf = (
+                SparkConf()
+                .setMaster(mode)
+                .set("spark.executor.cores", "12")
+                .set("spark.task.cpus", "1")
+                .set("spark.executor.resource.gpu.amount", "1")
+            )
+            msg_match = (
+                "The `spark.task.resource.gpu.amount` is required for training on GPU"
+            )
+            with pytest.raises(ValueError, match=msg_match):
+                classifer_on_gpu._validate_gpu_params("3.3.0", bad_conf)
+            with pytest.raises(ValueError, match=msg_match):
+                classifer_on_gpu._validate_gpu_params("3.4.0", bad_conf)
+            with pytest.raises(ValueError, match=msg_match):
+                classifer_on_gpu._validate_gpu_params("3.5.0", bad_conf)
+
+            classifer_on_gpu._validate_gpu_params("3.5.1", bad_conf)
+
+    def test_skip_stage_level_scheduling(self) -> None:
+        standalone_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+
+        classifer_on_cpu = SparkXGBClassifier(use_gpu=False)
+        classifer_on_gpu = SparkXGBClassifier(use_gpu=True)
+
+        # the correct configurations should not skip stage-level scheduling
+        assert not classifer_on_gpu._skip_stage_level_scheduling(
+            "3.4.0", standalone_conf
+        )
+        assert not classifer_on_gpu._skip_stage_level_scheduling(
+            "3.4.1", standalone_conf
+        )
+        assert not classifer_on_gpu._skip_stage_level_scheduling(
+            "3.5.0", standalone_conf
+        )
+        assert not classifer_on_gpu._skip_stage_level_scheduling(
+            "3.5.1", standalone_conf
+        )
+
+        # spark version < 3.4.0
+        assert classifer_on_gpu._skip_stage_level_scheduling("3.3.0", standalone_conf)
+        # not run on GPU
+        assert classifer_on_cpu._skip_stage_level_scheduling("3.4.0", standalone_conf)
+
+        # spark.executor.cores is not set
+        bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+        assert classifer_on_gpu._skip_stage_level_scheduling("3.4.0", bad_conf)
+
+        # spark.executor.cores=1
+        bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "1")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+        assert classifer_on_gpu._skip_stage_level_scheduling("3.4.0", bad_conf)
+
+        # spark.executor.resource.gpu.amount is not set
+        bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+        assert classifer_on_gpu._skip_stage_level_scheduling("3.4.0", bad_conf)
+
+        # spark.executor.resource.gpu.amount>1
+        bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "2")
+            .set("spark.task.resource.gpu.amount", "0.08")
+        )
+        assert classifer_on_gpu._skip_stage_level_scheduling("3.4.0", bad_conf)
+
+        # spark.task.resource.gpu.amount is not set
+        bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+        )
+        assert not classifer_on_gpu._skip_stage_level_scheduling("3.4.0", bad_conf)
+
+        # spark.task.resource.gpu.amount=1
+        bad_conf = (
+            SparkConf()
+            .setMaster("spark://foo")
+            .set("spark.executor.cores", "12")
+            .set("spark.task.cpus", "1")
+            .set("spark.executor.resource.gpu.amount", "1")
+            .set("spark.task.resource.gpu.amount", "1")
+        )
+        assert classifer_on_gpu._skip_stage_level_scheduling("3.4.0", bad_conf)
+
+        # For Yarn and K8S
+        for mode in ["yarn", "k8s://"]:
+            for gpu_amount in ["0.08", "0.2", "1.0"]:
+                conf = (
+                    SparkConf()
+                    .setMaster(mode)
+                    .set("spark.executor.cores", "12")
+                    .set("spark.task.cpus", "1")
+                    .set("spark.executor.resource.gpu.amount", "1")
+                    .set("spark.task.resource.gpu.amount", gpu_amount)
+                )
+                assert classifer_on_gpu._skip_stage_level_scheduling("3.3.0", conf)
+                assert classifer_on_gpu._skip_stage_level_scheduling("3.4.0", conf)
+                assert classifer_on_gpu._skip_stage_level_scheduling("3.4.1", conf)
+                assert classifer_on_gpu._skip_stage_level_scheduling("3.5.0", conf)
+
+                # This will be fixed when spark 4.0.0 is released.
+                if gpu_amount == "1.0":
+                    assert classifer_on_gpu._skip_stage_level_scheduling("3.5.1", conf)
+                else:
+                    # Starting from 3.5.1+, stage-level scheduling is working for Yarn and K8s
+                    assert not classifer_on_gpu._skip_stage_level_scheduling(
+                        "3.5.1", conf
+                    )
+
+    @pytest.mark.parametrize("tree_method", ["hist", "approx"])
+    def test_empty_train_data(self, spark: SparkSession, tree_method: str) -> None:
+        df_train = spark.createDataFrame(
+            [
+                (Vectors.dense(10.1, 11.2, 11.3), 0, True),
+                (Vectors.dense(1, 1.2, 1.3), 1, True),
+                (Vectors.dense(14.0, 15.0, 16.0), 0, True),
+                (Vectors.dense(1.1, 1.2, 1.3), 1, False),
+            ],
+            ["features", "label", "val_col"],
+        )
+        classifier = SparkXGBRegressor(
+            num_workers=2,
+            min_child_weight=0.0,
+            reg_alpha=0,
+            reg_lambda=0,
+            tree_method=tree_method,
+            validation_indicator_col="val_col",
+        )
+        model = classifier.fit(df_train)
+        pred_result = model.transform(df_train).collect()
+        for row in pred_result:
+            assert row.prediction == 1.0
+
+    def test_regressor_xgb_summary(self, reg_with_weight: RegWithWeight) -> None:
+        reg_df_train = reg_with_weight.reg_df_train_with_eval_weight.filter(
+            spark_sql_func.col("isVal") == False
+        )
+        spark_xgb_model = SparkXGBRegressor(eval_metric="rmse").fit(reg_df_train)
+
+        np.testing.assert_allclose(
+            reg_with_weight.reg_expected_evals_result_train,
+            spark_xgb_model.training_summary.train_objective_history["rmse"],
+            atol=1e-3,
+        )
+
+        assert spark_xgb_model.training_summary.validation_objective_history == {}
+
+    def test_regressor_xgb_summary_with_validation(
+        self, reg_with_weight: RegWithWeight
+    ) -> None:
+        spark_xgb_model = SparkXGBRegressor(
+            eval_metric="rmse", validation_indicator_col="isVal"
+        ).fit(
+            reg_with_weight.reg_df_train_with_eval_weight,
+        )
+
+        np.testing.assert_allclose(
+            reg_with_weight.reg_expected_evals_result_train,
+            spark_xgb_model.training_summary.train_objective_history["rmse"],
+            atol=1e-3,
+        )
+
+        np.testing.assert_allclose(
+            reg_with_weight.reg_expected_evals_result_validation,
+            spark_xgb_model.training_summary.validation_objective_history["rmse"],
+            atol=1e-3,
+        )
+
+    def test_classifier_xgb_summary(self, clf_with_weight: ClfWithWeight) -> None:
+        clf_df_train = clf_with_weight.cls_df_train_with_eval_weight.filter(
+            spark_sql_func.col("isVal") == False
+        )
+        spark_xgb_model = SparkXGBClassifier(eval_metric="logloss").fit(clf_df_train)
+
+        np.testing.assert_allclose(
+            clf_with_weight.cls_expected_evals_result_train,
+            spark_xgb_model.training_summary.train_objective_history["logloss"],
+            atol=1e-3,
+        )
+
+        assert spark_xgb_model.training_summary.validation_objective_history == {}
+
+    def test_classifier_xgb_summary_with_validation(
+        self, clf_with_weight: ClfWithWeight
+    ) -> None:
+        spark_xgb_model = SparkXGBClassifier(
+            eval_metric="logloss", validation_indicator_col="isVal"
+        ).fit(
+            clf_with_weight.cls_df_train_with_eval_weight,
+        )
+
+        np.testing.assert_allclose(
+            clf_with_weight.cls_expected_evals_result_train,
+            spark_xgb_model.training_summary.train_objective_history["logloss"],
+            atol=1e-3,
+        )
+
+        np.testing.assert_allclose(
+            clf_with_weight.cls_expected_evals_result_validation,
+            spark_xgb_model.training_summary.validation_objective_history["logloss"],
+            atol=1e-3,
+        )
 
 
 class XgboostLocalTest(SparkTestCase):
@@ -1019,52 +1501,6 @@ class XgboostLocalTest(SparkTestCase):
         assert sklearn_regressor.max_depth == 3
         assert sklearn_regressor.get_params()["sketch_eps"] == 0.5
 
-    def test_regressor_params_basic(self):
-        py_reg = SparkXGBRegressor()
-        self.assertTrue(hasattr(py_reg, "n_estimators"))
-        self.assertEqual(py_reg.n_estimators.parent, py_reg.uid)
-        self.assertFalse(hasattr(py_reg, "gpu_id"))
-        self.assertEqual(py_reg.getOrDefault(py_reg.n_estimators), 100)
-        self.assertEqual(py_reg.getOrDefault(py_reg.objective), "reg:squarederror")
-        py_reg2 = SparkXGBRegressor(n_estimators=200)
-        self.assertEqual(py_reg2.getOrDefault(py_reg2.n_estimators), 200)
-        py_reg3 = py_reg2.copy({py_reg2.max_depth: 10})
-        self.assertEqual(py_reg3.getOrDefault(py_reg3.n_estimators), 200)
-        self.assertEqual(py_reg3.getOrDefault(py_reg3.max_depth), 10)
-
-    def test_classifier_params_basic(self):
-        py_cls = SparkXGBClassifier()
-        self.assertTrue(hasattr(py_cls, "n_estimators"))
-        self.assertEqual(py_cls.n_estimators.parent, py_cls.uid)
-        self.assertFalse(hasattr(py_cls, "gpu_id"))
-        self.assertEqual(py_cls.getOrDefault(py_cls.n_estimators), 100)
-        self.assertEqual(py_cls.getOrDefault(py_cls.objective), None)
-        py_cls2 = SparkXGBClassifier(n_estimators=200)
-        self.assertEqual(py_cls2.getOrDefault(py_cls2.n_estimators), 200)
-        py_cls3 = py_cls2.copy({py_cls2.max_depth: 10})
-        self.assertEqual(py_cls3.getOrDefault(py_cls3.n_estimators), 200)
-        self.assertEqual(py_cls3.getOrDefault(py_cls3.max_depth), 10)
-
-    def test_classifier_kwargs_basic(self):
-        py_cls = SparkXGBClassifier(**self.cls_params_kwargs)
-        self.assertTrue(hasattr(py_cls, "n_estimators"))
-        self.assertEqual(py_cls.n_estimators.parent, py_cls.uid)
-        self.assertFalse(hasattr(py_cls, "gpu_id"))
-        self.assertTrue(hasattr(py_cls, "arbitrary_params_dict"))
-        expected_kwargs = {"sketch_eps": 0.03}
-        self.assertEqual(
-            py_cls.getOrDefault(py_cls.arbitrary_params_dict), expected_kwargs
-        )
-
-        # Testing overwritten params
-        py_cls = SparkXGBClassifier()
-        py_cls.setParams(x=1, y=2)
-        py_cls.setParams(y=3, z=4)
-        xgb_params = py_cls._gen_xgb_params_dict()
-        assert xgb_params["x"] == 1
-        assert xgb_params["y"] == 3
-        assert xgb_params["z"] == 4
-
     def test_param_alias(self):
         py_cls = SparkXGBClassifier(features_col="f1", label_col="l1")
         self.assertEqual(py_cls.getOrDefault(py_cls.featuresCol), "f1")
@@ -1116,7 +1552,9 @@ class XgboostLocalTest(SparkTestCase):
         reg1 = SparkXGBRegressor(**self.reg_params)
         model = reg1.fit(self.reg_df_train)
         init_booster = model.get_booster()
-        reg2 = SparkXGBRegressor(max_depth=2, n_estimators=2, xgb_model=init_booster)
+        reg2 = SparkXGBRegressor(
+            max_depth=2, n_estimators=2, xgb_model=init_booster, max_bin=21
+        )
         model21 = reg2.fit(self.reg_df_train)
         pred_res21 = model21.transform(self.reg_df_test).collect()
         reg2.save(path)
@@ -1193,16 +1631,6 @@ class XgboostLocalTest(SparkTestCase):
         self.assertRaises(ValueError, regressor._validate_params)
         classifier = SparkXGBClassifier(num_workers=0)
         self.assertRaises(ValueError, classifier._validate_params)
-
-    def test_use_gpu_param(self):
-        classifier = SparkXGBClassifier(use_gpu=True, tree_method="exact")
-        self.assertRaises(ValueError, classifier._validate_params)
-        regressor = SparkXGBRegressor(use_gpu=True, tree_method="exact")
-        self.assertRaises(ValueError, regressor._validate_params)
-        regressor = SparkXGBRegressor(use_gpu=True, tree_method="gpu_hist")
-        regressor = SparkXGBRegressor(use_gpu=True)
-        classifier = SparkXGBClassifier(use_gpu=True, tree_method="gpu_hist")
-        classifier = SparkXGBClassifier(use_gpu=True)
 
     def test_feature_importances(self):
         reg1 = SparkXGBRegressor(**self.reg_params)
@@ -1290,33 +1718,6 @@ class XgboostLocalTest(SparkTestCase):
             for row in pred_result:
                 self.assertEqual(row.prediction, row.label)
 
-    def test_empty_train_data(self) -> None:
-        for tree_method in [
-            "hist",
-            "approx",
-        ]:  # pytest.mark conflict with python unittest
-            df_train = self.session.createDataFrame(
-                [
-                    (Vectors.dense(10.1, 11.2, 11.3), 0, True),
-                    (Vectors.dense(1, 1.2, 1.3), 1, True),
-                    (Vectors.dense(14.0, 15.0, 16.0), 0, True),
-                    (Vectors.dense(1.1, 1.2, 1.3), 1, False),
-                ],
-                ["features", "label", "val_col"],
-            )
-            classifier = SparkXGBClassifier(
-                num_workers=2,
-                min_child_weight=0.0,
-                reg_alpha=0,
-                reg_lambda=0,
-                tree_method=tree_method,
-                validation_indicator_col="val_col",
-            )
-            model = classifier.fit(df_train)
-            pred_result = model.transform(df_train).collect()
-            for row in pred_result:
-                assert row.prediction == 1.0
-
     def test_empty_partition(self):
         # raw_df.repartition(4) will result int severe data skew, actually,
         # there is no any data in reducer partition 1, reducer partition 2
@@ -1341,62 +1742,237 @@ class XgboostLocalTest(SparkTestCase):
         with pytest.raises(ValueError, match="evals_result"):
             SparkXGBClassifier(evals_result={})
 
+    def test_collective_conf(self):
+        classifier = SparkXGBClassifier(
+            launch_tracker_on_driver=True,
+            coll_cfg=Config(tracker_host_ip="192.168.1.32", tracker_port=59981),
+        )
+        with pytest.raises(Exception, match="Failed to bind socket"):
+            classifier._get_tracker_args()
 
-class XgboostRankerLocalTest(SparkTestCase):
-    def setUp(self):
-        self.session.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "8")
-        self.ranker_df_train = self.session.createDataFrame(
-            [
-                (Vectors.dense(1.0, 2.0, 3.0), 0, 0),
-                (Vectors.dense(4.0, 5.0, 6.0), 1, 0),
-                (Vectors.dense(9.0, 4.0, 8.0), 2, 0),
-                (Vectors.sparse(3, {1: 1.0, 2: 5.5}), 0, 1),
-                (Vectors.sparse(3, {1: 6.0, 2: 7.5}), 1, 1),
-                (Vectors.sparse(3, {1: 8.0, 2: 9.5}), 2, 1),
-            ],
-            ["features", "label", "qid"],
+        classifier = SparkXGBClassifier(
+            launch_tracker_on_driver=False,
+            coll_cfg=Config(tracker_host_ip="127.0.0.1", tracker_port=58892),
         )
-        self.ranker_df_test = self.session.createDataFrame(
-            [
-                (Vectors.dense(1.5, 2.0, 3.0), 0, -1.87988),
-                (Vectors.dense(4.5, 5.0, 6.0), 0, 0.29556),
-                (Vectors.dense(9.0, 4.5, 8.0), 0, 2.36570),
-                (Vectors.sparse(3, {1: 1.0, 2: 6.0}), 1, -1.87988),
-                (Vectors.sparse(3, {1: 6.0, 2: 7.0}), 1, -0.30612),
-                (Vectors.sparse(3, {1: 8.0, 2: 10.5}), 1, 2.44826),
-            ],
-            ["features", "qid", "expected_prediction"],
-        )
-        self.ranker_df_train_1 = self.session.createDataFrame(
-            [
-                (Vectors.sparse(3, {1: 1.0, 2: 5.5}), 0, 9),
-                (Vectors.sparse(3, {1: 6.0, 2: 7.5}), 1, 9),
-                (Vectors.sparse(3, {1: 8.0, 2: 9.5}), 2, 9),
-                (Vectors.dense(1.0, 2.0, 3.0), 0, 8),
-                (Vectors.dense(4.0, 5.0, 6.0), 1, 8),
-                (Vectors.dense(9.0, 4.0, 8.0), 2, 8),
-                (Vectors.sparse(3, {1: 1.0, 2: 5.5}), 0, 7),
-                (Vectors.sparse(3, {1: 6.0, 2: 7.5}), 1, 7),
-                (Vectors.sparse(3, {1: 8.0, 2: 9.5}), 2, 7),
-                (Vectors.dense(1.0, 2.0, 3.0), 0, 6),
-                (Vectors.dense(4.0, 5.0, 6.0), 1, 6),
-                (Vectors.dense(9.0, 4.0, 8.0), 2, 6),
-            ]
-            * 4,
-            ["features", "label", "qid"],
-        )
+        with pytest.raises(
+            ValueError, match="You must enable launch_tracker_on_driver"
+        ):
+            classifier._get_tracker_args()
 
-    def test_ranker(self):
-        ranker = SparkXGBRanker(qid_col="qid")
+        classifier = SparkXGBClassifier(
+            launch_tracker_on_driver=True,
+            coll_cfg=Config(tracker_host_ip="127.0.0.1", tracker_port=58893),
+            num_workers=2,
+        )
+        launch_tracker_on_driver, rabit_envs = classifier._get_tracker_args()
+        assert launch_tracker_on_driver is True
+        assert rabit_envs["n_workers"] == 2
+        assert rabit_envs["dmlc_tracker_uri"] == "127.0.0.1"
+        assert rabit_envs["dmlc_tracker_port"] == 58893
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = "file:" + tmpdir
+            classifier = SparkXGBClassifier(
+                launch_tracker_on_driver=True,
+                coll_cfg=Config(tracker_host_ip="127.0.0.1", tracker_port=58894),
+                num_workers=1,
+                n_estimators=1,
+            )
+
+            def check_conf(conf: Config) -> None:
+                assert conf.tracker_host_ip == "127.0.0.1"
+                assert conf.tracker_port == 58894
+
+            check_conf(classifier.getOrDefault(classifier.coll_cfg))
+            classifier.write().overwrite().save(path)
+
+            loaded_classifier = SparkXGBClassifier.load(path)
+            check_conf(loaded_classifier.getOrDefault(loaded_classifier.coll_cfg))
+
+            model = classifier.fit(self.cls_df_sparse_train)
+            check_conf(model.getOrDefault(model.coll_cfg))
+
+            model.write().overwrite().save(path)
+            loaded_model = SparkXGBClassifierModel.load(path)
+            check_conf(loaded_model.getOrDefault(loaded_model.coll_cfg))
+
+
+LTRData = namedtuple(
+    "LTRData",
+    (
+        "df_train",
+        "df_test",
+        "df_train_1",
+        "ranker_df_merged",
+        "expected_evals_result_train",
+        "expected_evals_result_validation",
+    ),
+)
+
+
+@pytest.fixture
+def ltr_data(spark: SparkSession) -> Generator[LTRData, None, None]:
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "8")
+    ranker_df_train = spark.createDataFrame(
+        [
+            (Vectors.dense(1.0, 2.0, 3.0), 0, 0),
+            (Vectors.dense(4.0, 5.0, 6.0), 1, 0),
+            (Vectors.dense(9.0, 4.0, 8.0), 2, 0),
+            (Vectors.sparse(3, {1: 1.0, 2: 5.5}), 0, 1),
+            (Vectors.sparse(3, {1: 6.0, 2: 7.5}), 1, 1),
+            (Vectors.sparse(3, {1: 8.0, 2: 9.5}), 2, 1),
+        ],
+        ["features", "label", "qid"],
+    )
+    X_train = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [9.0, 4.0, 8.0],
+            [np.nan, 1.0, 5.5],
+            [np.nan, 6.0, 7.5],
+            [np.nan, 8.0, 9.5],
+        ]
+    )
+    qid_train = np.array([0, 0, 0, 1, 1, 1])
+    y_train = np.array([0, 1, 2, 0, 1, 2])
+
+    X_test = np.array(
+        [
+            [1.5, 2.0, 3.0],
+            [4.5, 5.0, 6.0],
+            [9.0, 4.5, 8.0],
+            [np.nan, 1.0, 6.0],
+            [np.nan, 6.0, 7.0],
+            [np.nan, 8.0, 10.5],
+        ]
+    )
+    qid_test = np.array([0, 0, 0, 1, 1, 1])
+    y_test = np.array([1, 0, 2, 1, 1, 2])
+
+    ltr = xgb.XGBRanker(tree_method="approx", objective="rank:pairwise")
+    ltr.fit(X_train, y_train, qid=qid_train)
+    predt = ltr.predict(X_test)
+
+    ltr2 = xgb.XGBRanker(tree_method="approx", objective="rank:pairwise")
+    ltr2.fit(
+        X_train,
+        y_train,
+        qid=qid_train,
+        eval_set=[(X_train, y_train), (X_test, y_test)],
+        eval_qid=[qid_train, qid_test],
+    )
+    evals_result = ltr2.evals_result()
+    expected_evals_result_train = evals_result["validation_0"]["ndcg@32"]
+    expected_evals_result_validation = evals_result["validation_1"]["ndcg@32"]
+
+    ranker_df_test = spark.createDataFrame(
+        [
+            (Vectors.dense(1.5, 2.0, 3.0), 0, float(predt[0]), 1),
+            (Vectors.dense(4.5, 5.0, 6.0), 0, float(predt[1]), 0),
+            (Vectors.dense(9.0, 4.5, 8.0), 0, float(predt[2]), 2),
+            (Vectors.sparse(3, {1: 1.0, 2: 6.0}), 1, float(predt[3]), 1),
+            (Vectors.sparse(3, {1: 6.0, 2: 7.0}), 1, float(predt[4]), 1),
+            (Vectors.sparse(3, {1: 8.0, 2: 10.5}), 1, float(predt[5]), 2),
+        ],
+        ["features", "qid", "expected_prediction", "label"],
+    )
+
+    ranker_df_merged = (
+        ranker_df_train.select(["features", "label", "qid"])
+        .withColumn("isVal", spark_sql_func.lit(False))
+        .union(
+            ranker_df_test.select(["features", "label", "qid"]).withColumn(
+                "isVal", spark_sql_func.lit(True)
+            )
+        )
+    )
+
+    ranker_df_train_1 = spark.createDataFrame(
+        [
+            (Vectors.sparse(3, {1: 1.0, 2: 5.5}), 0, 9),
+            (Vectors.sparse(3, {1: 6.0, 2: 7.5}), 1, 9),
+            (Vectors.sparse(3, {1: 8.0, 2: 9.5}), 2, 9),
+            (Vectors.dense(1.0, 2.0, 3.0), 0, 8),
+            (Vectors.dense(4.0, 5.0, 6.0), 1, 8),
+            (Vectors.dense(9.0, 4.0, 8.0), 2, 8),
+            (Vectors.sparse(3, {1: 1.0, 2: 5.5}), 0, 7),
+            (Vectors.sparse(3, {1: 6.0, 2: 7.5}), 1, 7),
+            (Vectors.sparse(3, {1: 8.0, 2: 9.5}), 2, 7),
+            (Vectors.dense(1.0, 2.0, 3.0), 0, 6),
+            (Vectors.dense(4.0, 5.0, 6.0), 1, 6),
+            (Vectors.dense(9.0, 4.0, 8.0), 2, 6),
+        ]
+        * 4,
+        ["features", "label", "qid"],
+    )
+    yield LTRData(
+        ranker_df_train,
+        ranker_df_test,
+        ranker_df_train_1,
+        ranker_df_merged,
+        expected_evals_result_train,
+        expected_evals_result_validation,
+    )
+
+
+class TestPySparkLocalLETOR:
+    def test_ranker(self, ltr_data: LTRData) -> None:
+        ranker = SparkXGBRanker(qid_col="qid", objective="rank:pairwise")
         assert ranker.getOrDefault(ranker.objective) == "rank:pairwise"
-        model = ranker.fit(self.ranker_df_train)
-        pred_result = model.transform(self.ranker_df_test).collect()
-
+        model = ranker.fit(ltr_data.df_train)
+        pred_result = model.transform(ltr_data.df_test).collect()
         for row in pred_result:
             assert np.isclose(row.prediction, row.expected_prediction, rtol=1e-3)
 
-    def test_ranker_qid_sorted(self):
-        ranker = SparkXGBRanker(qid_col="qid", num_workers=4)
-        assert ranker.getOrDefault(ranker.objective) == "rank:pairwise"
-        model = ranker.fit(self.ranker_df_train_1)
-        model.transform(self.ranker_df_test).collect()
+    def test_ranker_qid_sorted(self, ltr_data: LTRData) -> None:
+        ranker = SparkXGBRanker(qid_col="qid", num_workers=4, objective="rank:ndcg")
+        assert ranker.getOrDefault(ranker.objective) == "rank:ndcg"
+        model = ranker.fit(ltr_data.df_train_1)
+        model.transform(ltr_data.df_test).collect()
+
+    def test_ranker_same_qid_in_same_partition(self, ltr_data: LTRData) -> None:
+        ranker = SparkXGBRanker(qid_col="qid", num_workers=4, force_repartition=True)
+        df, _ = ranker._prepare_input(ltr_data.df_train_1)
+
+        def f(iterator: Iterable) -> List[int]:
+            yield list(set(iterator))
+
+        rows = df.select("qid").rdd.mapPartitions(f).collect()
+        assert len(rows) == 4
+        for row in rows:
+            assert len(row) == 1
+            assert row[0].qid in [6, 7, 8, 9]
+
+    def test_ranker_xgb_summary(self, ltr_data: LTRData) -> None:
+        spark_xgb_model = SparkXGBRanker(
+            tree_method="approx", qid_col="qid", objective="rank:pairwise"
+        ).fit(ltr_data.df_train)
+
+        np.testing.assert_allclose(
+            ltr_data.expected_evals_result_train,
+            spark_xgb_model.training_summary.train_objective_history["ndcg@32"],
+            atol=1e-3,
+        )
+
+        assert spark_xgb_model.training_summary.validation_objective_history == {}
+
+    def test_ranker_xgb_summary_with_validation(self, ltr_data: LTRData) -> None:
+        spark_xgb_model = SparkXGBRanker(
+            tree_method="approx",
+            qid_col="qid",
+            objective="rank:pairwise",
+            validation_indicator_col="isVal",
+        ).fit(ltr_data.ranker_df_merged)
+
+        np.testing.assert_allclose(
+            ltr_data.expected_evals_result_train,
+            spark_xgb_model.training_summary.train_objective_history["ndcg@32"],
+            atol=1e-3,
+        )
+
+        np.testing.assert_allclose(
+            ltr_data.expected_evals_result_validation,
+            spark_xgb_model.training_summary.validation_objective_history["ndcg@32"],
+            atol=1e-3,
+        )

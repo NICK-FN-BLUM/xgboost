@@ -1,34 +1,29 @@
-/*!
- *  Copyright (c) 2019~2021 by Contributors
+/**
+ *  Copyright 2019-2025, XGBoost Contributors
  * \file adapter.h
  */
 #ifndef XGBOOST_DATA_ADAPTER_H_
 #define XGBOOST_DATA_ADAPTER_H_
 #include <dmlc/data.h>
 
-#include <algorithm>
-#include <cstddef>  // std::size_t
-#include <functional>
-#include <limits>
-#include <map>
-#include <memory>
-#include <string>
-#include <utility>  // std::move
-#include <vector>
+#include <algorithm>  // for transform, all_of
+#include <cmath>      // for isfinite
+#include <cstddef>    // for size_t
+#include <cstdint>    // for uint8_t
+#include <limits>     // for numeric_limits
+#include <memory>     // for unique_ptr, make_unique
+#include <utility>    // for move
+#include <vector>     // for vector
 
-#include "../c_api/c_api_error.h"
 #include "../common/math.h"
 #include "array_interface.h"
-#include "arrow-cdi.h"
 #include "xgboost/base.h"
 #include "xgboost/data.h"
 #include "xgboost/logging.h"
 #include "xgboost/span.h"
 #include "xgboost/string_view.h"
 
-namespace xgboost {
-namespace data {
-
+namespace xgboost::data {
 /**  External data formats should implement an adapter as below. The
  * adapter provides a uniform access to data outside xgboost, allowing
  * construction of DMatrix objects from a range of sources without duplicating
@@ -76,11 +71,11 @@ constexpr size_t kAdapterUnknownSize = std::numeric_limits<size_t >::max();
 
 struct COOTuple {
   COOTuple() = default;
-  XGBOOST_DEVICE COOTuple(size_t row_idx, size_t column_idx, float value)
+  XGBOOST_DEVICE COOTuple(bst_idx_t row_idx, bst_idx_t column_idx, float value)
       : row_idx(row_idx), column_idx(column_idx), value(value) {}
 
-  size_t row_idx{0};
-  size_t column_idx{0};
+  bst_idx_t row_idx{0};
+  bst_idx_t column_idx{0};
   float value{0};
 };
 
@@ -139,12 +134,8 @@ class CSRAdapterBatch : public detail::NoMetaInfo {
  public:
   class Line {
    public:
-    Line(size_t row_idx, size_t size, const unsigned* feature_idx,
-         const float* values)
-        : row_idx_(row_idx),
-          size_(size),
-          feature_idx_(feature_idx),
-          values_(values) {}
+    Line(bst_idx_t row_idx, bst_idx_t size, const unsigned* feature_idx, const float* values)
+        : row_idx_(row_idx), size_(size), feature_idx_(feature_idx), values_(values) {}
 
     size_t Size() const { return size_; }
     COOTuple GetElement(size_t idx) const {
@@ -152,8 +143,8 @@ class CSRAdapterBatch : public detail::NoMetaInfo {
     }
 
    private:
-    size_t row_idx_;
-    size_t size_;
+    bst_idx_t row_idx_;
+    bst_idx_t size_;
     const unsigned* feature_idx_;
     const float* values_;
   };
@@ -181,29 +172,25 @@ class CSRAdapterBatch : public detail::NoMetaInfo {
 
 class CSRAdapter : public detail::SingleBatchDataIter<CSRAdapterBatch> {
  public:
-  CSRAdapter(const size_t* row_ptr, const unsigned* feature_idx,
-             const float* values, size_t num_rows, size_t num_elements,
-             size_t num_features)
-      : batch_(row_ptr, feature_idx, values, num_rows, num_elements,
-               num_features),
+  CSRAdapter(const size_t* row_ptr, const unsigned* feature_idx, const float* values,
+             bst_idx_t num_rows, bst_idx_t num_elements, size_t num_features)
+      : batch_(row_ptr, feature_idx, values, num_rows, num_elements, num_features),
         num_rows_(num_rows),
         num_columns_(num_features) {}
   const CSRAdapterBatch& Value() const override { return batch_; }
-  size_t NumRows() const { return num_rows_; }
-  size_t NumColumns() const { return num_columns_; }
+  bst_idx_t NumRows() const { return num_rows_; }
+  bst_idx_t NumColumns() const { return num_columns_; }
 
  private:
   CSRAdapterBatch batch_;
-  size_t num_rows_;
-  size_t num_columns_;
+  bst_idx_t num_rows_;
+  bst_idx_t num_columns_;
 };
 
 class DenseAdapterBatch : public detail::NoMetaInfo {
  public:
-  DenseAdapterBatch(const float* values, size_t num_rows, size_t num_features)
-      : values_(values),
-        num_rows_(num_rows),
-        num_features_(num_features) {}
+  DenseAdapterBatch(const float* values, bst_idx_t num_rows, bst_idx_t num_features)
+      : values_(values), num_rows_(num_rows), num_features_(num_features) {}
 
  private:
   class Line {
@@ -267,7 +254,7 @@ class ArrayAdapterBatch : public detail::NoMetaInfo {
     Line(ArrayInterface<2> array_interface, size_t ridx)
         : array_interface_{std::move(array_interface)}, ridx_{ridx} {}
 
-    size_t Size() const { return array_interface_.Shape(1); }
+    size_t Size() const { return array_interface_.Shape<1>(); }
 
     COOTuple GetElement(size_t idx) const {
       return {ridx_, idx, array_interface_(ridx_, idx)};
@@ -280,9 +267,9 @@ class ArrayAdapterBatch : public detail::NoMetaInfo {
     return Line{array_interface_, idx};
   }
 
-  size_t NumRows() const { return array_interface_.Shape(0); }
-  size_t NumCols() const { return array_interface_.Shape(1); }
-  size_t Size() const { return this->NumRows(); }
+  [[nodiscard]] std::size_t NumRows() const { return array_interface_.Shape<0>(); }
+  [[nodiscard]] std::size_t NumCols() const { return array_interface_.Shape<1>(); }
+  [[nodiscard]] std::size_t Size() const { return this->NumRows(); }
 
   explicit ArrayAdapterBatch(ArrayInterface<2> array_interface)
       : array_interface_{std::move(array_interface)} {}
@@ -300,9 +287,9 @@ class ArrayAdapter : public detail::SingleBatchDataIter<ArrayAdapterBatch> {
     array_interface_ = ArrayInterface<2>(get<Object const>(j));
     batch_ = ArrayAdapterBatch{array_interface_};
   }
-  ArrayAdapterBatch const& Value() const override { return batch_; }
-  size_t NumRows() const { return array_interface_.Shape(0); }
-  size_t NumColumns() const { return array_interface_.Shape(1); }
+  [[nodiscard]] ArrayAdapterBatch const& Value() const override { return batch_; }
+  [[nodiscard]] std::size_t NumRows() const { return array_interface_.Shape<0>(); }
+  [[nodiscard]] std::size_t NumColumns() const { return array_interface_.Shape<1>(); }
 
  private:
   ArrayAdapterBatch batch_;
@@ -327,12 +314,12 @@ class CSRArrayAdapterBatch : public detail::NoMetaInfo {
         : indices_{std::move(indices)}, values_{std::move(values)}, ridx_{ridx},
           offset_{offset} {}
 
-    COOTuple GetElement(std::size_t idx) const {
+    [[nodiscard]] COOTuple GetElement(std::size_t idx) const {
       return {ridx_, TypedIndex<std::size_t, 1>{indices_}(offset_ + idx), values_(offset_ + idx)};
     }
 
-    size_t Size() const {
-      return values_.Shape(0);
+    [[nodiscard]] std::size_t Size() const {
+      return values_.Shape<0>();
     }
   };
 
@@ -350,7 +337,7 @@ class CSRArrayAdapterBatch : public detail::NoMetaInfo {
   }
 
   size_t NumRows() const {
-    size_t size = indptr_.Shape(0);
+    size_t size = indptr_.Shape<0>();
     size = size == 0 ? 0 : size - 1;
     return size;
   }
@@ -392,9 +379,9 @@ class CSRArrayAdapter : public detail::SingleBatchDataIter<CSRArrayAdapterBatch>
     return batch_;
   }
   size_t NumRows() const {
-    size_t size = indptr_.Shape(0);
+    size_t size = indptr_.Shape<0>();
     size = size == 0 ? 0 : size - 1;
-    return  size;
+    return size;
   }
   size_t NumColumns() const { return num_cols_; }
 
@@ -476,7 +463,6 @@ class CSCArrayAdapterBatch : public detail::NoMetaInfo {
   ArrayInterface<1> indptr_;
   ArrayInterface<1> indices_;
   ArrayInterface<1> values_;
-  bst_row_t n_rows_;
 
   class Line {
     std::size_t column_idx_;
@@ -491,7 +477,7 @@ class CSCArrayAdapterBatch : public detail::NoMetaInfo {
           values_{std::move(values)},
           offset_{offset} {}
 
-    std::size_t Size() const { return values_.Shape(0); }
+    std::size_t Size() const { return values_.Shape<0>(); }
     COOTuple GetElement(std::size_t idx) const {
       return {TypedIndex<std::size_t, 1>{row_idx_}(offset_ + idx), column_idx_,
               values_(offset_ + idx)};
@@ -502,11 +488,8 @@ class CSCArrayAdapterBatch : public detail::NoMetaInfo {
   static constexpr bool kIsRowMajor = false;
 
   CSCArrayAdapterBatch(ArrayInterface<1> indptr, ArrayInterface<1> indices,
-                       ArrayInterface<1> values, bst_row_t n_rows)
-      : indptr_{std::move(indptr)},
-        indices_{std::move(indices)},
-        values_{std::move(values)},
-        n_rows_{n_rows} {}
+                       ArrayInterface<1> values)
+      : indptr_{std::move(indptr)}, indices_{std::move(indices)}, values_{std::move(values)} {}
 
   std::size_t Size() const { return indptr_.n - 1; }
   Line GetLine(std::size_t idx) const {
@@ -541,138 +524,85 @@ class CSCArrayAdapter : public detail::SingleBatchDataIter<CSCArrayAdapterBatch>
         indices_{indices},
         values_{values},
         num_rows_{num_rows},
-        batch_{
-            CSCArrayAdapterBatch{indptr_, indices_, values_, static_cast<bst_row_t>(num_rows_)}} {}
+        batch_{CSCArrayAdapterBatch{indptr_, indices_, values_}} {}
 
   // JVM package sends 0 as unknown
-  size_t NumRows() const { return num_rows_ == 0 ? kAdapterUnknownSize : num_rows_; }
-  size_t NumColumns() const { return indptr_.n - 1; }
-  const CSCArrayAdapterBatch& Value() const override { return batch_; }
+  [[nodiscard]] std::size_t NumRows() const {
+    return num_rows_ == 0 ? kAdapterUnknownSize : num_rows_;
+  }
+  [[nodiscard]] std::size_t NumColumns() const { return indptr_.n - 1; }
+  [[nodiscard]] const CSCArrayAdapterBatch& Value() const override { return batch_; }
 };
 
-class DataTableAdapterBatch : public detail::NoMetaInfo {
-  enum class DTType : std::uint8_t {
-    kFloat32 = 0,
-    kFloat64 = 1,
-    kBool8 = 2,
-    kInt32 = 3,
-    kInt8 = 4,
-    kInt16 = 5,
-    kInt64 = 6,
-    kUnknown = 7
-  };
+class ColumnarAdapterBatch : public detail::NoMetaInfo {
+  common::Span<ArrayInterface<1>> columns_;
 
-  static DTType DTGetType(std::string type_string) {
-    if (type_string == "float32") {
-      return DTType::kFloat32;
-    } else if (type_string == "float64") {
-      return DTType::kFloat64;
-    } else if (type_string == "bool8") {
-      return DTType::kBool8;
-    } else if (type_string == "int32") {
-      return DTType::kInt32;
-    } else if (type_string == "int8") {
-      return DTType::kInt8;
-    } else if (type_string == "int16") {
-      return DTType::kInt16;
-    } else if (type_string == "int64") {
-      return DTType::kInt64;
-    } else {
-      LOG(FATAL) << "Unknown data table type.";
-      return DTType::kUnknown;
-    }
-  }
-
- public:
-  DataTableAdapterBatch(void const* const* const data, char const* const* feature_stypes,
-                        std::size_t num_rows, std::size_t num_features)
-      : data_(data), num_rows_(num_rows) {
-    CHECK(feature_types_.empty());
-    std::transform(feature_stypes, feature_stypes + num_features,
-                   std::back_inserter(feature_types_),
-                   [](char const* stype) { return DTGetType(stype); });
-  }
-
- private:
   class Line {
-    std::size_t row_idx_;
-    void const* const* const data_;
-    std::vector<DTType> const& feature_types_;
-
-    float DTGetValue(void const* column, DTType dt_type, std::size_t ridx) const {
-      float missing = std::numeric_limits<float>::quiet_NaN();
-      switch (dt_type) {
-        case DTType::kFloat32: {
-          float val = reinterpret_cast<const float*>(column)[ridx];
-          return std::isfinite(val) ? val : missing;
-        }
-        case DTType::kFloat64: {
-          double val = reinterpret_cast<const double*>(column)[ridx];
-          return std::isfinite(val) ? static_cast<float>(val) : missing;
-        }
-        case DTType::kBool8: {
-          bool val = reinterpret_cast<const bool*>(column)[ridx];
-          return static_cast<float>(val);
-        }
-        case DTType::kInt32: {
-          int32_t val = reinterpret_cast<const int32_t*>(column)[ridx];
-          return val != (-2147483647 - 1) ? static_cast<float>(val) : missing;
-        }
-        case DTType::kInt8: {
-          int8_t val = reinterpret_cast<const int8_t*>(column)[ridx];
-          return val != -128 ? static_cast<float>(val) : missing;
-        }
-        case DTType::kInt16: {
-          int16_t val = reinterpret_cast<const int16_t*>(column)[ridx];
-          return val != -32768 ? static_cast<float>(val) : missing;
-        }
-        case DTType::kInt64: {
-          int64_t val = reinterpret_cast<const int64_t*>(column)[ridx];
-          return val != -9223372036854775807 - 1 ? static_cast<float>(val) : missing;
-        }
-        default: {
-          LOG(FATAL) << "Unknown data table type.";
-          return 0.0f;
-        }
-      }
-    }
+    common::Span<ArrayInterface<1>> const& columns_;
+    std::size_t const ridx_;
 
    public:
-    Line(std::size_t ridx, void const* const* const data, std::vector<DTType> const& ft)
-        : row_idx_{ridx}, data_{data}, feature_types_{ft} {}
-    std::size_t Size() const { return feature_types_.size(); }
-    COOTuple GetElement(std::size_t idx) const {
-      return COOTuple{row_idx_, idx, DTGetValue(data_[idx], feature_types_[idx], row_idx_)};
+    explicit Line(common::Span<ArrayInterface<1>> const& columns, std::size_t ridx)
+        : columns_{columns}, ridx_{ridx} {}
+    [[nodiscard]] std::size_t Size() const { return columns_.empty() ? 0 : columns_.size(); }
+
+    [[nodiscard]] COOTuple GetElement(std::size_t fidx) const {
+      auto const& column = columns_.data()[fidx];
+      float value = column.valid.Data() == nullptr || column.valid.Check(ridx_)
+                        ? column(ridx_)
+                        : std::numeric_limits<float>::quiet_NaN();
+      return {ridx_, fidx, value};
     }
   };
 
  public:
-  size_t Size() const { return num_rows_; }
-  const Line GetLine(std::size_t ridx) const { return {ridx, data_, feature_types_}; }
+  ColumnarAdapterBatch() = default;
+  explicit ColumnarAdapterBatch(common::Span<ArrayInterface<1>> columns) : columns_{columns} {}
+  [[nodiscard]] Line GetLine(std::size_t ridx) const { return Line{columns_, ridx}; }
+  [[nodiscard]] std::size_t Size() const {
+    return columns_.empty() ? 0 : columns_.front().Shape<0>();
+  }
+  [[nodiscard]] std::size_t NumCols() const { return columns_.empty() ? 0 : columns_.size(); }
+  [[nodiscard]] std::size_t NumRows() const { return this->Size(); }
+
   static constexpr bool kIsRowMajor = true;
-
- private:
-  void const* const* const data_;
-
-  std::vector<DTType> feature_types_;
-  std::size_t num_rows_;
 };
 
-class DataTableAdapter : public detail::SingleBatchDataIter<DataTableAdapterBatch> {
- public:
-  DataTableAdapter(void** data, const char** feature_stypes, std::size_t num_rows,
-                   std::size_t num_features)
-      : batch_(data, feature_stypes, num_rows, num_features),
-        num_rows_(num_rows),
-        num_columns_(num_features) {}
-  const DataTableAdapterBatch& Value() const override { return batch_; }
-  std::size_t NumRows() const { return num_rows_; }
-  std::size_t NumColumns() const { return num_columns_; }
+class ColumnarAdapter : public detail::SingleBatchDataIter<ColumnarAdapterBatch> {
+  std::vector<ArrayInterface<1>> columns_;
+  ColumnarAdapterBatch batch_;
 
- private:
-  DataTableAdapterBatch batch_;
-  std::size_t num_rows_;
-  std::size_t num_columns_;
+ public:
+  explicit ColumnarAdapter(StringView columns) {
+    auto jarray = Json::Load(columns);
+    CHECK(IsA<Array>(jarray));
+    auto const& array = get<Array const>(jarray);
+    for (auto col : array) {
+      columns_.emplace_back(get<Object const>(col));
+    }
+    bool consistent =
+        columns_.empty() ||
+        std::all_of(columns_.cbegin(), columns_.cend(), [&](ArrayInterface<1> const& array) {
+          return array.Shape<0>() == columns_[0].Shape<0>();
+        });
+    CHECK(consistent) << "Size of columns should be the same.";
+    batch_ = ColumnarAdapterBatch{columns_};
+  }
+
+  [[nodiscard]] ColumnarAdapterBatch const& Value() const override { return batch_; }
+
+  [[nodiscard]] std::size_t NumRows() const {
+    if (!columns_.empty()) {
+      return columns_.front().shape[0];
+    }
+    return 0;
+  }
+  [[nodiscard]] std::size_t NumColumns() const {
+    if (!columns_.empty()) {
+      return columns_.size();
+    }
+    return 0;
+  }
 };
 
 class FileAdapterBatch {
@@ -747,8 +677,10 @@ class FileAdapter : dmlc::DataIter<FileAdapterBatch> {
   dmlc::Parser<uint32_t>* parser_;
 };
 
-/*! \brief Data iterator that takes callback to return data, used in JVM package for
- *  accepting data iterator. */
+/**
+ * @brief Data iterator that takes callback to return data, used in JVM package for accepting data
+ *        iterator.
+ */
 template <typename DataIterHandle, typename XGBCallbackDataIterNext, typename XGBoostBatchCSR>
 class IteratorAdapter : public dmlc::DataIter<FileAdapterBatch> {
  public:
@@ -762,23 +694,9 @@ class IteratorAdapter : public dmlc::DataIter<FileAdapterBatch> {
     CHECK(at_first_) << "Cannot reset IteratorAdapter";
   }
 
-  bool Next() override {
-    if ((*next_callback_)(
-            data_handle_,
-            [](void *handle, XGBoostBatchCSR batch) -> int {
-              API_BEGIN();
-              static_cast<IteratorAdapter *>(handle)->SetData(batch);
-              API_END();
-            },
-            this) != 0) {
-      at_first_ = false;
-      return true;
-    } else {
-      return false;
-    }
-  }
+  [[nodiscard]] bool Next() override;
 
-  FileAdapterBatch const& Value() const override {
+  [[nodiscard]] FileAdapterBatch const& Value() const override {
     return *batch_.get();
   }
 
@@ -826,12 +744,12 @@ class IteratorAdapter : public dmlc::DataIter<FileAdapterBatch> {
     block_.index = dmlc::BeginPtr(index_);
     block_.value = dmlc::BeginPtr(value_);
 
-    batch_.reset(new FileAdapterBatch(&block_, row_offset_));
+    batch_ = std::make_unique<FileAdapterBatch>(&block_, row_offset_);
     row_offset_ += offset_.size() - 1;
   }
 
-  size_t NumColumns() const { return columns_; }
-  size_t NumRows() const { return kAdapterUnknownSize; }
+  [[nodiscard]] std::size_t NumColumns() const { return columns_; }
+  [[nodiscard]] std::size_t NumRows() const { return kAdapterUnknownSize; }
 
  private:
   std::vector<size_t> offset_;
@@ -853,356 +771,6 @@ class IteratorAdapter : public dmlc::DataIter<FileAdapterBatch> {
   std::unique_ptr<FileAdapterBatch> batch_;
 };
 
-enum ColumnDType : uint8_t {
-  kUnknown,
-  kInt8,
-  kUInt8,
-  kInt16,
-  kUInt16,
-  kInt32,
-  kUInt32,
-  kInt64,
-  kUInt64,
-  kFloat,
-  kDouble
-};
-
-class Column {
- public:
-  Column() = default;
-
-  Column(size_t col_idx, size_t length, size_t null_count, const uint8_t* bitmap)
-    : col_idx_{col_idx}, length_{length}, null_count_{null_count}, bitmap_{bitmap} {}
-
-  virtual ~Column() = default;
-
-  Column(const Column&) = delete;
-  Column& operator=(const Column&) = delete;
-  Column(Column&&) = delete;
-  Column& operator=(Column&&) = delete;
-
-  // whether the valid bit is set for this element
-  bool IsValid(size_t row_idx) const {
-    return (!bitmap_ || (bitmap_[row_idx/8] & (1 << (row_idx%8))));
-  }
-
-  virtual COOTuple GetElement(size_t row_idx) const = 0;
-
-  virtual bool IsValidElement(size_t row_idx) const = 0;
-
-  virtual std::vector<float> AsFloatVector() const = 0;
-
-  virtual std::vector<uint64_t> AsUint64Vector() const = 0;
-
-  size_t Length() const { return length_; }
-
- protected:
-  size_t col_idx_;
-  size_t length_;
-  size_t null_count_;
-  const uint8_t* bitmap_;
-};
-
-// Only columns of primitive types are supported. An ArrowColumnarBatch is a
-// collection of std::shared_ptr<PrimitiveColumn>. These columns can be of different data types.
-// Hence, PrimitiveColumn is a class template; and all concrete PrimitiveColumns
-// derive from the abstract class Column.
-template <typename T>
-class PrimitiveColumn : public Column {
-  static constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
-
- public:
-  PrimitiveColumn(size_t idx, size_t length, size_t null_count,
-                  const uint8_t* bitmap, const T* data, float missing)
-    : Column{idx, length, null_count, bitmap}, data_{data}, missing_{missing} {}
-
-  COOTuple GetElement(size_t row_idx) const override {
-    CHECK(data_ && row_idx < length_) << "Column is empty or out-of-bound index of the column";
-    return { row_idx, col_idx_, IsValidElement(row_idx) ?
-                  static_cast<float>(data_[row_idx]) : kNaN };
-  }
-
-  bool IsValidElement(size_t row_idx) const override {
-    // std::isfinite needs to cast to double to prevent msvc report error
-    return IsValid(row_idx)
-            && std::isfinite(static_cast<double>(data_[row_idx]))
-            && static_cast<float>(data_[row_idx]) != missing_;
-  }
-
-  std::vector<float> AsFloatVector() const override {
-    CHECK(data_) << "Column is empty";
-    std::vector<float> fv(length_);
-    std::transform(data_, data_ + length_, fv.begin(),
-        [](T v) { return static_cast<float>(v); });
-    return fv;
-  }
-
-  std::vector<uint64_t> AsUint64Vector() const override {
-    CHECK(data_) << "Column is empty";
-    std::vector<uint64_t> iv(length_);
-    std::transform(data_, data_ + length_, iv.begin(),
-        [](T v) { return static_cast<uint64_t>(v); });
-    return iv;
-  }
-
- private:
-  const T* data_;
-  float missing_;  // user specified missing value
-};
-
-struct ColumnarMetaInfo {
-  // data type of the column
-  ColumnDType type{ColumnDType::kUnknown};
-  // location of the column in an Arrow record batch
-  int64_t loc{-1};
-};
-
-struct ArrowSchemaImporter {
-  std::vector<ColumnarMetaInfo> columns;
-
-  // map Arrow format strings to types
-  static ColumnDType FormatMap(char const* format_str) {
-    CHECK(format_str) << "Format string cannot be empty";
-    switch (format_str[0]) {
-      case 'c':
-        return ColumnDType::kInt8;
-      case 'C':
-        return ColumnDType::kUInt8;
-      case 's':
-        return ColumnDType::kInt16;
-      case 'S':
-        return ColumnDType::kUInt16;
-      case 'i':
-        return ColumnDType::kInt32;
-      case 'I':
-        return ColumnDType::kUInt32;
-      case 'l':
-        return ColumnDType::kInt64;
-      case 'L':
-        return ColumnDType::kUInt64;
-      case 'f':
-        return ColumnDType::kFloat;
-      case 'g':
-        return ColumnDType::kDouble;
-      default:
-        CHECK(false) << "Column data type not supported by XGBoost";
-        return ColumnDType::kUnknown;
-    }
-  }
-
-  void Import(struct ArrowSchema *schema) {
-    if (schema) {
-      CHECK(std::string(schema->format) == "+s"); // NOLINT
-      CHECK(columns.empty());
-      for (auto i = 0; i < schema->n_children; ++i) {
-        std::string name{schema->children[i]->name};
-        ColumnDType type = FormatMap(schema->children[i]->format);
-        ColumnarMetaInfo col_info{type, i};
-        columns.push_back(col_info);
-      }
-      if (schema->release) {
-        schema->release(schema);
-      }
-    }
-  }
-};
-
-class ArrowColumnarBatch {
- public:
-  ArrowColumnarBatch(struct ArrowArray *rb, struct ArrowSchemaImporter* schema)
-    : rb_{rb}, schema_{schema} {
-    CHECK(rb_) << "Cannot import non-existent record batch";
-    CHECK(!schema_->columns.empty()) << "Cannot import record batch without a schema";
-  }
-
-  size_t Import(float missing) {
-    auto& infov = schema_->columns;
-    for (size_t i = 0; i < infov.size(); ++i) {
-      columns_.push_back(CreateColumn(i, infov[i], missing));
-    }
-
-    // Compute the starting location for every row in this batch
-    auto batch_size = rb_->length;
-    auto num_columns = columns_.size();
-    row_offsets_.resize(batch_size + 1, 0);
-    for (auto i = 0; i < batch_size; ++i) {
-      row_offsets_[i+1] = row_offsets_[i];
-      for (size_t j = 0; j < num_columns; ++j) {
-        if (GetColumn(j).IsValidElement(i)) {
-          row_offsets_[i+1]++;
-        }
-      }
-    }
-    // return number of elements in the batch
-    return row_offsets_.back();
-  }
-
-  ArrowColumnarBatch(const ArrowColumnarBatch&) = delete;
-  ArrowColumnarBatch& operator=(const ArrowColumnarBatch&) = delete;
-  ArrowColumnarBatch(ArrowColumnarBatch&&) = delete;
-  ArrowColumnarBatch& operator=(ArrowColumnarBatch&&) = delete;
-
-  virtual ~ArrowColumnarBatch() {
-    if (rb_ && rb_->release) {
-      rb_->release(rb_);
-      rb_ = nullptr;
-    }
-    columns_.clear();
-  }
-
-  size_t Size() const { return rb_ ? rb_->length : 0; }
-
-  size_t NumColumns() const { return columns_.size(); }
-
-  size_t NumElements() const { return row_offsets_.back(); }
-
-  const Column& GetColumn(size_t col_idx) const {
-    return *columns_[col_idx];
-  }
-
-  void ShiftRowOffsets(size_t batch_offset) {
-    std::transform(row_offsets_.begin(), row_offsets_.end(), row_offsets_.begin(),
-        [=](size_t c) { return c + batch_offset; });
-  }
-
-  const std::vector<size_t>& RowOffsets() const { return row_offsets_; }
-
- private:
-  std::shared_ptr<Column> CreateColumn(size_t idx,
-                                      ColumnarMetaInfo info,
-                                      float missing) const {
-    if (info.loc < 0) {
-      return nullptr;
-    }
-
-    auto loc_in_batch = info.loc;
-    auto length = rb_->length;
-    auto null_count = rb_->null_count;
-    auto buffers0 = rb_->children[loc_in_batch]->buffers[0];
-    auto buffers1 = rb_->children[loc_in_batch]->buffers[1];
-    const uint8_t* bitmap = buffers0 ? reinterpret_cast<const uint8_t*>(buffers0) : nullptr;
-    const uint8_t* data = buffers1 ? reinterpret_cast<const uint8_t*>(buffers1) : nullptr;
-
-    // if null_count is not computed, compute it here
-    if (null_count < 0) {
-      if (!bitmap) {
-        null_count = 0;
-      } else {
-        null_count = length;
-        for (auto i = 0; i < length; ++i) {
-          if (bitmap[i/8] & (1 << (i%8))) {
-            null_count--;
-          }
-        }
-      }
-    }
-
-    switch (info.type) {
-      case ColumnDType::kInt8:
-        return std::make_shared<PrimitiveColumn<int8_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const int8_t*>(data), missing);
-      case ColumnDType::kUInt8:
-        return std::make_shared<PrimitiveColumn<uint8_t>>(
-            idx, length, null_count, bitmap, data, missing);
-      case ColumnDType::kInt16:
-        return std::make_shared<PrimitiveColumn<int16_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const int16_t*>(data), missing);
-      case ColumnDType::kUInt16:
-        return std::make_shared<PrimitiveColumn<uint16_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const uint16_t*>(data), missing);
-      case ColumnDType::kInt32:
-        return std::make_shared<PrimitiveColumn<int32_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const int32_t*>(data), missing);
-      case ColumnDType::kUInt32:
-        return std::make_shared<PrimitiveColumn<uint32_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const uint32_t*>(data), missing);
-      case ColumnDType::kInt64:
-        return std::make_shared<PrimitiveColumn<int64_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const int64_t*>(data), missing);
-      case ColumnDType::kUInt64:
-        return std::make_shared<PrimitiveColumn<uint64_t>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const uint64_t*>(data), missing);
-      case ColumnDType::kFloat:
-        return std::make_shared<PrimitiveColumn<float>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const float*>(data), missing);
-      case ColumnDType::kDouble:
-        return std::make_shared<PrimitiveColumn<double>>(
-            idx, length, null_count, bitmap,
-            reinterpret_cast<const double*>(data), missing);
-      default:
-        return nullptr;
-    }
-  }
-
-  struct ArrowArray* rb_;
-  struct ArrowSchemaImporter* schema_;
-  std::vector<std::shared_ptr<Column>> columns_;
-  std::vector<size_t> row_offsets_;
-};
-
-using ArrowColumnarBatchVec = std::vector<std::unique_ptr<ArrowColumnarBatch>>;
-class RecordBatchesIterAdapter: public dmlc::DataIter<ArrowColumnarBatchVec> {
- public:
-  RecordBatchesIterAdapter(XGDMatrixCallbackNext* next_callback, int nbatch)
-      : next_callback_{next_callback}, nbatches_{nbatch} {}
-
-  void BeforeFirst() override {
-    CHECK(at_first_) << "Cannot reset RecordBatchesIterAdapter";
-  }
-
-  bool Next() override {
-    batches_.clear();
-    while (batches_.size() < static_cast<size_t>(nbatches_) && (*next_callback_)(this) != 0) {
-      at_first_ = false;
-    }
-
-    if (batches_.size() > 0) {
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  void SetData(struct ArrowArray* rb, struct ArrowSchema* schema) {
-    // Schema is only imported once at the beginning, regardless how many
-    // baches are comming.
-    // But even schema is not imported we still need to release its C data
-    // exported from Arrow.
-    if (at_first_ && schema) {
-      schema_.Import(schema);
-    } else {
-      if (schema && schema->release) {
-        schema->release(schema);
-      }
-    }
-    if (rb) {
-      batches_.push_back(std::make_unique<ArrowColumnarBatch>(rb, &schema_));
-    }
-  }
-
-  const ArrowColumnarBatchVec& Value() const override {
-    return batches_;
-  }
-
-  size_t NumColumns() const { return schema_.columns.size(); }
-  size_t NumRows() const { return kAdapterUnknownSize; }
-
- private:
-  XGDMatrixCallbackNext *next_callback_;
-  bool at_first_{true};
-  int nbatches_;
-  struct ArrowSchemaImporter schema_;
-  ArrowColumnarBatchVec batches_;
-};
-
 class SparsePageAdapterBatch {
   HostSparsePageView page_;
 
@@ -1210,7 +778,7 @@ class SparsePageAdapterBatch {
   struct Line {
     Entry const* inst;
     size_t n;
-    bst_row_t ridx;
+    bst_idx_t ridx;
     COOTuple GetElement(size_t idx) const { return {ridx, inst[idx].index, inst[idx].fvalue}; }
     size_t Size() const { return n; }
   };
@@ -1219,6 +787,5 @@ class SparsePageAdapterBatch {
   Line GetLine(size_t ridx) const { return Line{page_[ridx].data(), page_[ridx].size(), ridx}; }
   size_t Size() const { return page_.Size(); }
 };
-};  // namespace data
-}  // namespace xgboost
+}  // namespace xgboost::data
 #endif  // XGBOOST_DATA_ADAPTER_H_

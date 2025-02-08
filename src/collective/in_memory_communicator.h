@@ -15,14 +15,14 @@ namespace collective {
 /**
  * An in-memory communicator, useful for testing.
  */
-class InMemoryCommunicator : public Communicator {
+class InMemoryCommunicator {
  public:
   /**
    * @brief Create a new communicator based on JSON configuration.
    * @param config JSON configuration.
    * @return Communicator as specified by the JSON configuration.
    */
-  static Communicator* Create(Json const& config) {
+  static InMemoryCommunicator* Create(Json const& config) {
     int world_size{0};
     int rank{-1};
 
@@ -51,7 +51,7 @@ class InMemoryCommunicator : public Communicator {
     return new InMemoryCommunicator(world_size, rank);
   }
 
-  InMemoryCommunicator(int world_size, int rank) : Communicator(world_size, rank) {
+  InMemoryCommunicator(int world_size, int rank) {
     handler_.Init(world_size, rank);
   }
 
@@ -60,11 +60,16 @@ class InMemoryCommunicator : public Communicator {
   bool IsDistributed() const override { return true; }
   bool IsFederated() const override { return false; }
 
-  void AllGather(void* in_out, std::size_t size) override {
+  std::string AllGather(std::string_view input) override {
     std::string output;
-    handler_.Allgather(static_cast<const char*>(in_out), size, &output, sequence_number_++,
-                       GetRank());
-    output.copy(static_cast<char*>(in_out), size);
+    handler_.Allgather(input.data(), input.size(), &output, sequence_number_++, GetRank());
+    return output;
+  }
+
+  std::string AllGatherV(std::string_view input) override {
+    std::string output;
+    handler_.AllgatherV(input.data(), input.size(), &output, sequence_number_++, GetRank());
+    return output;
   }
 
   void AllReduce(void* in_out, std::size_t size, DataType data_type, Operation operation) override {

@@ -1,5 +1,5 @@
 /**
- * Copyright 2014-2023 by XGBoost Contributors
+ * Copyright 2014-2024, XGBoost Contributors
  * \file objective.h
  * \brief interface of objective function used by xgboost.
  * \author Tianqi Chen, Kailong Chen
@@ -17,8 +17,6 @@
 #include <cstdint>  // std::int32_t
 #include <functional>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace xgboost {
 
@@ -40,18 +38,17 @@ class ObjFunction : public Configurable {
    * \brief Configure the objective with the specified parameters.
    * \param args arguments to the objective function.
    */
-  virtual void Configure(const std::vector<std::pair<std::string, std::string> >& args) = 0;
-  /*!
-   * \brief Get gradient over each of predictions, given existing information.
-   * \param preds prediction of current round
-   * \param info information about labels, weights, groups in rank
-   * \param iteration current iteration number.
-   * \param out_gpair output of get gradient, saves gradient and second order gradient in
+  virtual void Configure(Args const& args) = 0;
+  /**
+   * @brief Get gradient over each of predictions, given existing information.
+   *
+   * @param preds prediction of current round
+   * @param info information about labels, weights, groups in rank
+   * @param iteration current iteration number.
+   * @param out_gpair output of get gradient, saves gradient and second order gradient in
    */
-  virtual void GetGradient(const HostDeviceVector<bst_float>& preds,
-                           const MetaInfo& info,
-                           int iteration,
-                           HostDeviceVector<GradientPair>* out_gpair) = 0;
+  virtual void GetGradient(HostDeviceVector<float> const& preds, MetaInfo const& info,
+                           std::int32_t iter, linalg::Matrix<GradientPair>* out_gpair) = 0;
 
   /*! \return the default evaluation metric for the objective */
   virtual const char* DefaultEvalMetric() const = 0;
@@ -61,47 +58,51 @@ class ObjFunction : public Configurable {
   virtual Json DefaultMetricConfig() const { return Json{Null{}}; }
 
   // the following functions are optional, most of time default implementation is good enough
-  /*!
-   * \brief transform prediction values, this is only called when Prediction is called
-   * \param io_preds prediction values, saves to this vector as well
-   */
-  virtual void PredTransform(HostDeviceVector<bst_float>*) const {}
-
-  /*!
-   * \brief transform prediction values, this is only called when Eval is called,
-   *  usually it redirect to PredTransform
-   * \param io_preds prediction values, saves to this vector as well
-   */
-  virtual void EvalTransform(HostDeviceVector<bst_float> *io_preds) {
-    this->PredTransform(io_preds);
-  }
-  /*!
-   * \brief transform probability value back to margin
-   * this is used to transform user-set base_score back to margin
-   * used by gradient boosting
-   * \return transformed value
-   */
-  virtual bst_float ProbToMargin(bst_float base_score) const {
-    return base_score;
-  }
   /**
-   * \brief Make initialize estimation of prediction.
+   * @brief Apply inverse link (activation) function to prediction values.
    *
-   * \param info MetaInfo that contains label.
-   * \param base_score Output estimation.
+   *   This is only called when Prediction is called
+   *
+   * @param [in,out] io_preds prediction values, saves to this vector as well.
+   */
+  virtual void PredTransform(HostDeviceVector<float>*) const {}
+  /**
+   * @brief Apply inverse link (activation) function to prediction values
+   *
+   *  This is only called when Eval is called, usually it redirect to PredTransform
+   *
+   * @param [in,out] io_preds prediction values, saves to this vector as well.
+   */
+  virtual void EvalTransform(HostDeviceVector<float>* io_preds) { this->PredTransform(io_preds); }
+  /**
+   * @brief Apply link function to the intercept.
+   *
+   *   This is used to transform user-set base_score back to margin used by gradient
+   *   boosting
+   *
+   * @return transformed value
+   */
+  [[nodiscard]] virtual float ProbToMargin(float base_score) const { return base_score; }
+  /**
+   * @brief Obtain the initial estimation of prediction.
+   *
+   *   The output in `base_score` represents prediction after apply the inverse link function.
+   *
+   * @param info MetaInfo that contains label.
+   * @param base_score Output estimation.
    */
   virtual void InitEstimation(MetaInfo const& info, linalg::Tensor<float, 1>* base_score) const;
   /*!
    * \brief Return task of this objective.
    */
-  virtual struct ObjInfo Task() const = 0;
+  [[nodiscard]] virtual struct ObjInfo Task() const = 0;
   /**
-   * \brief Return number of targets for input matrix.  Right now XGBoost supports only
+   * @brief Return number of targets for input matrix.  Right now XGBoost supports only
    *        multi-target regression.
    */
-  virtual bst_target_t Targets(MetaInfo const& info) const {
+  [[nodiscard]] virtual bst_target_t Targets(MetaInfo const& info) const {
     if (info.labels.Shape(1) > 1) {
-      LOG(FATAL) << "multioutput is not supported by current objective function";
+      LOG(FATAL) << "multioutput is not supported by the current objective function";
     }
     return 1;
   }
